@@ -1,0 +1,105 @@
+# Shaped after mercadopago/sdk-python's CI so the SDK team sees a familiar pipeline:
+# same linters, same `unittest discover`. The `contract` jobs are the addition — see
+# tests/test_contract.py for why they exist.
+name: CI - Lint and Tests
+
+on:
+  pull_request:
+    branches:
+      - 'main'
+  push:
+    branches:
+      - 'main'
+  schedule:
+    # Weekly, for the drift-warning job below only.
+    - cron: '0 6 * * 1'
+
+env:
+  # The commerce-agents commit this release is known to work against. Bump it
+  # deliberately, with the contract test green.
+  COMMERCE_AGENTS_REF: fd4d59224ab96b43c6dc6888207c67b3bd5a24cf
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pylint isort
+
+      # No network and nothing from Anthropic's repo: the package must stand alone.
+      - name: Test
+        run: python -m unittest discover -s tests
+
+      - name: Lint with Pylint
+        run: pylint --max-line-length=100 src/mercadopago_commerce_agents
+
+      - name: Lint with Isort
+        run: isort --check-only --diff src tests
+
+  contract:
+    # Blocking. Proves this release works with the pinned commerce-agents commit.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/checkout@v4
+        with:
+          repository: anthropics/commerce-agents
+          ref: ${{ env.COMMERCE_AGENTS_REF }}
+          path: commerce-agents
+
+      - name: Install with commerce-agents
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install ./commerce-agents/commerce-common ./commerce-agents/shopping-agent/core
+
+      - name: Contract test
+        run: python -m unittest tests.test_contract -v
+
+  contract-drift-warning:
+    # Non-blocking early warning: the same test against upstream HEAD. A failure here
+    # means the next pin bump needs work, not that this release is broken.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/checkout@v4
+        with:
+          repository: anthropics/commerce-agents
+          ref: main
+          path: commerce-agents
+
+      - name: Install with commerce-agents@main
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install ./commerce-agents/commerce-common ./commerce-agents/shopping-agent/core
+
+      - name: Contract test against upstream HEAD
+        run: python -m unittest tests.test_contract -v

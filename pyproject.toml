@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools >= 77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Provisional PyPI distribution name; confirm it before the first release.
+name = "mercadopago-commerce-agents"
+version = "0.1.0"
+authors = [{ name = "Mercado Pago", email = "mp_sdk@mercadopago.com" }]
+description = "Mercado Pago Checkout Pro as a checkout_handoff provider for commerce-agents"
+readme = "README.md"
+keywords = ["mercadopago", "checkout", "commerce-agents", "shopping-agent", "ai agents"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+# commerce-agents' own floor: shopping-agent-core declares requires-python >= 3.11.
+# Nothing here needs 3.11, but a host that cannot run the agent cannot use this either.
+requires-python = ">=3.11"
+dependencies = [
+    # Floor is the version this was tested end-to-end against, not the oldest that
+    # might work: it is what a fresh install resolves to anyway, and a payment path is
+    # the wrong place to be generous about an untested range.
+    "mercadopago>=3.5.0",
+    # Used directly for its exception types when catching transport failures.
+    "requests",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Deliberately NOT a dependency: shopping-agent-core. It is versioned 0.1.0.dev0 and
+# pins commerce-common==0.1.0.dev0 precisely so that a lone install fails rather than
+# resolving a public distribution of the same name, so depending on it would make this
+# package uninstallable from PyPI at best and a dependency-confusion risk at worst.
+# src/mercadopago_commerce_agents/types.py carries the one type we need instead. To run
+# the contract test against the real thing, install it from a clone — see the README.
+
+[project.urls]
+Homepage = "https://www.mercadopago.com.br/developers"
+Source = "https://github.com/mercadopago/commerce-agents-checkout"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+src_paths = ["src", "tests"]

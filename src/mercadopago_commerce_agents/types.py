@@ -1,8 +1,7 @@
 # Copyright 2026 Mercado Pago
 # SPDX-License-Identifier: Apache-2.0
 
-"""The one type this package hands back to commerce-agents, declared here so that
-installing it needs nothing from Anthropic's repository.
+"""Public handoff and persistence values without an Anthropic runtime dependency.
 
 ``shopping_agent.types.CheckoutHandoff`` is a three-field pydantic model, and the only
 thing the shopping agent ever does with a handoff is call ``.model_dump(exclude_none=True)``

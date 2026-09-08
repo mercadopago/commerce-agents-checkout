@@ -16,6 +16,7 @@ from Anthropic's repository. CI runs it in a job that clones the repo at a pinne
 commit — see ``.github/workflows/ci.yml``.
 """
 
+import os
 import unittest
 from dataclasses import MISSING
 from types import SimpleNamespace
@@ -29,6 +30,8 @@ try:  # commerce-agents is an optional, unpublished dependency
 
     UPSTREAM = True
 except ImportError:  # pragma: no cover - the default local run
+    if os.environ.get("REQUIRE_COMMERCE_AGENTS") == "1":
+        raise
     UPSTREAM = False
 
 

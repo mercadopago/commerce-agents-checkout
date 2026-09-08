@@ -10,4 +10,8 @@ for the wiring and for why it needs your catalog.
 from .checkout import Catalog, MercadoPagoCheckout
 from .types import CheckoutHandoff
 
-__all__ = ["Catalog", "CheckoutHandoff", "MercadoPagoCheckout"]
+__all__ = [
+    "Catalog",
+    "CheckoutHandoff",
+    "MercadoPagoCheckout",
+]

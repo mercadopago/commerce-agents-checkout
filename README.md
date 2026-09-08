@@ -1,65 +1,57 @@
-# commerce-agents-checkout
+# Mercado Pago Checkout Pro for commerce-agents
 
-Mercado Pago Checkout Pro as a `checkout_handoff` provider for
+Mercado Pago Checkout Pro via Orders API as a `checkout_handoff` provider for
 [anthropics/commerce-agents](https://github.com/anthropics/commerce-agents).
 
-> **Staging repository.** This is the Mercado Pago organization repository, but the
-> package has not been published or exercised against the real Mercado Pago API yet.
-> Do not point production traffic at it. `HANDOFF-sdk-team.md` records the remaining
-> work and decisions for the SDK team.
+> **Pre-release repository.** The package has not been published to PyPI. The Orders API
+> flow has been exercised end to end against the real API — an order is created, read
+> back, and its hosted Checkout Pro URL opens — but completing a payment on that hosted
+> page and the WebSec review below are still open. Use dedicated test users until both
+> are done.
 
-## Where this stands
+The shopping agent deliberately stops before payment. Its `checkout` tool renders the
+cart, and the backend adds the hosted checkout URL *after* the model's tool call. This
+package implements that backend handoff with a server-side Mercado Pago order and
+returns the validated `checkout_url` to the host.
 
-Last updated 2026-09-04. Written for whoever picks this up next.
+This version uses `POST /v1/orders` with `processing_mode=manual`. It does **not** create
+a Checkout Pro preference or call `POST /checkout/preferences`; the Orders API returns
+the hosted Checkout Pro URL directly.
 
-**Verified.** 26 tests pass; CI runs them on Python 3.11 and 3.12. `pylint` is
-10.00/10 and `isort` is clean. The contract test runs the *real* `enrich_checkout` from
-commerce-agents against this package's own `CheckoutHandoff` and passes against pinned
-commit `fd4d5922` — that is what justifies not depending on `shopping-agent-core`. The
-built wheel installs into a clean environment with nothing from Anthropic present.
-Tested against `mercadopago` 3.5.0.
+## Requirements
 
-**Not verified — the real gap.** No request has ever reached the Mercado Pago API. Every
-test replaces the SDK call, so the preference body here is *believed* correct, not
-*known* correct. **Do this first:** run one handoff against a sandbox `TEST-` token and
-confirm the body is accepted without `items[].currency_id`, along with
-`expiration_date_to`'s format and `items[].id` as sent. Ideally repeat this with test
-accounts from two different Mercado Pago sites. The adapter does no currency
-conversion: catalog prices must already be in the seller account's currency.
-
-**Open items.**
-
-1. **The package name is provisional and not registered on PyPI.** Confirm the final
-   distribution name, then claim it under a Mercado Pago PyPI **organization**, never
-   a personal account.
-2. **Webhook verification is not in this package.** Configure the webhook URL on the
-   Mercado Pago application. Verifying `x-signature` and re-fetching the payment
-   server-side is the host's job today. If this package should own it, that is a
-   deliberate scope decision to make.
-
-**Two choices made here that the SDK team may overrule**, both flagged in the hand-off:
-Trusted Publishing (OIDC) instead of a long-lived `PYPI_TOKEN`, and Apache-2.0 where the
-SDK is MIT.
-
-commerce-agents' shopping agent deliberately stops before payment: its `checkout` tool
-renders the cart, and the hosted checkout URL is filled in by the backend *after* the
-model's tool call, so the URL never reaches the model. This package fills that one
-method with a real Checkout Pro preference.
+- Python 3.11 or newer.
+- A Mercado Pago application and a backend Access Token.
+- A `StorefrontBackend` implementation that can resolve every cart line from a trusted
+  catalog, including the currency each record is priced in.
+- `mercadopago` Python SDK 3.5.0 or newer.
 
 ## Install
 
+After the first PyPI release:
+
 ```bash
-# After the first PyPI release:
 pip install mercadopago-commerce-agents
 ```
 
-That is the whole install. This package depends only on the official
-[`mercadopago`](https://pypi.org/project/mercadopago/) SDK — nothing from Anthropic's
-repository, which is why it installs from PyPI on its own. (You still get
-commerce-agents itself the way Anthropic ships it: from a clone. They do not publish
-`shopping-agent-core`, on purpose.)
+The distribution and the import package share the same name:
 
-## Use
+```python
+from mercadopago_commerce_agents import MercadoPagoCheckout
+```
+
+Until then, install from a checkout of this repository:
+
+```bash
+python -m pip install -e .
+```
+
+The published package will depend only on the official
+[`mercadopago`](https://pypi.org/project/mercadopago/) SDK. Anthropic intentionally
+does not publish `shopping-agent-core`, so it is not a package dependency; install
+commerce-agents using Anthropic's own repository instructions.
+
+## Quick start
 
 ```python
 import os
@@ -69,9 +61,10 @@ import mercadopago
 from mercadopago_commerce_agents import MercadoPagoCheckout
 from shopping_agent import StorefrontBackend
 
+
 class MyBackend(StorefrontBackend):
     def __init__(self):
-        # `catalog=self` is what makes the charge trustworthy — see below.
+        # In production, load this value from your secrets manager.
         sdk = mercadopago.SDK(os.environ["MERCADOPAGO_ACCESS_TOKEN"])
         self.mercadopago = MercadoPagoCheckout(sdk=sdk, catalog=self)
 
@@ -79,104 +72,190 @@ class MyBackend(StorefrontBackend):
         return await self.mercadopago.checkout_handoff(session, cart)
 ```
 
-If your application keeps credentials in environment variables, it needs:
-
-```bash
-MERCADOPAGO_ACCESS_TOKEN=APP_USR-...
-```
-
-The package itself does not read the environment. Your application may source the token
-from an environment variable, a secrets manager, or dependency injection and configures
-the official SDK once. That SDK is the single source of truth for credentials,
-timeouts, retries and Mercado Pago headers; this adapter preserves those options.
-
-The constructor's normal path has only two required arguments: `sdk` and `catalog`.
-`reference_store` is the one optional advanced integration described below. Preference
-expiry (24 hours), checkout-host validation and the UI label policy are internal
-invariants rather than public configuration.
-
-## Why it needs your catalog
-
-A commerce-agents `Cart` is filled by the model's tool calls over a conversation, and
-the reference host authenticates nothing: the session travels in a raw `X-Session-Id`
-header. Sending `CartItem.price` to the preference API would therefore let whoever
-drives the conversation decide what the shopper is charged, on your own `APP_USR-`
-account — a cart priced at `0.01` for a real product would produce a valid, payable
-link.
-
-So this package never reads a price from the cart. It re-reads every line from your
-catalog through `StorefrontBackend.get_product_details` — an abstract method your
-backend already implements — and prices the preference from that. Passing
-`catalog=self` is the entire wiring. With no catalog configured it refuses to create a
-preference rather than falling back to cart prices.
-
-The cart still decides *which* products and *how many*. A line whose product is unknown
-or out of stock aborts the handoff.
-
-## Correlating payments back to a session
-
-`external_reference` is an opaque, per-preference value — never the session id, which
-is caller-supplied and would let a payment be bound to a session its payer does not
-own. To find the cart again from a webhook, give the package somewhere to record the
-mapping:
+That is the whole integration. The public surface is two constructor arguments and one
+per-call option:
 
 ```python
-async def remember(reference: str, session_id: str) -> None:
-    await my_store.put(reference, session_id)
+MercadoPagoCheckout(*, sdk, catalog)
 
-sdk = mercadopago.SDK(os.environ["MERCADOPAGO_ACCESS_TOKEN"])
-MercadoPagoCheckout(sdk=sdk, catalog=self, reference_store=remember)
+await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
 ```
 
-Configure notifications on the Mercado Pago application rather than per checkout.
-Verifying them is your handler's job and is not in this package yet: verify the
-`x-signature` HMAC, then re-fetch the payment from the API by id and trust only that
-server-side `status` and amount — never the notification body.
+- `sdk`: an already configured official Mercado Pago SDK instance. It owns credentials,
+  timeouts, retries and headers; the adapter clones its `RequestOptions` per call and
+  never mutates the shared instance.
+- `catalog`: an object exposing the async `get_product_details(session, product_id)`
+  method, returning a record with `title`, `price`, `currency`, and `in_stock is True`.
+  A `StorefrontBackend` can pass itself.
 
-## What this package does not fix
+There is no `currency` argument. The trusted catalog is already the authority for price,
+so it is the authority for currency too: every record must agree with the others and with
+the cart, and the created Order is checked against that same value. The currency is never
+sent — Mercado Pago resolves it from the seller account.
 
-It cannot authenticate the shopper; only your host can. Authenticate the session before
-wiring this in — an unauthenticated `X-Session-Id` is still an unauthenticated cart,
-whatever the checkout does.
+The package does not read environment variables, and it does not identify itself to
+Mercado Pago through configuration: the adapter's Platform ID travels on every order
+automatically.
 
-## Other behaviour worth knowing
+### Idempotency
 
-- Preferences expire after 24 hours, so a stale link cannot be paid at an old price.
-- Item currency is omitted. Mercado Pago is expected to resolve it from the seller
-  account; the catalog remains responsible for returning prices in that currency.
-- Retrying the same cart reuses the same idempotency key, so a looping agent gets the
-  original preference back instead of a second payable link. Its opaque
-  `external_reference` stays stable across the retry as well.
-- Per-request idempotency is added to a copy of the SDK's `RequestOptions`; the SDK
-  instance's timeout, retry and custom-header settings are preserved and never mutated.
-- `init_point` is checked against Mercado Pago's own hosts before being handed over, so
-  a response pointing elsewhere is dropped rather than rendered as your payment button.
-- Every failure path returns `[]` and logs; an outage degrades checkout instead of
-  breaking the turn. Rejections log Mercado Pago's error identifiers only, never the
-  rejected payload.
+`idempotency_key` identifies one checkout operation:
 
-## Development
+```python
+handoffs = await checkout.checkout_handoff(
+    session, cart, idempotency_key=request_idempotency_key
+)
+```
+
+- Omitted, a UUID v4 is generated for that call and its internal retries.
+- Supplied, it is validated and used exactly as given. An invalid value is refused; the
+  adapter never quietly mints a replacement, because that would turn a rejected duplicate
+  into a second payable order.
+- One key means one operation. A new purchase needs a new key, and Mercado Pago answers a
+  reused key carrying a different payload with `HTTP 409 idempotency_key_already_used`.
+- The key is never derived from the session id, an email, or any personal data.
+
+Automatic generation only covers the current call. Idempotency across calls, processes or
+restarts means your backend supplying the same key again.
+
+### Out of scope
+
+Webhook handling, persistence, Order reconciliation, fulfillment and payment confirmation
+belong to your backend. This package creates one Order and returns one validated URL; it
+stores nothing and calls nothing back.
+
+The `external_reference` it sends is a UUIDv5 derived from the idempotency key
+(`mpca-<uuid5>`), so a host that keeps its own key can correlate a webhook without any
+callback from this library. It never contains the session id.
+
+## What happens during `checkout_handoff`
+
+1. Reject an empty cart or more than 20 lines.
+2. Validate the idempotency key, or generate a UUID v4 when none was given.
+3. Resolve each product through the host's trusted catalog.
+4. Reject unknown lines unless stock is explicitly `True`, and validate price, currency,
+   and quantity with bounded inputs. Derive the currency from those records and require
+   the cart to agree.
+5. Compare the cart's price with the catalog. If it changed, return the fallback so the
+   host refreshes the cart and asks for confirmation again.
+6. Build an Orders API payload with:
+   - `type: online`
+   - `processing_mode: manual`
+   - the order `total_amount` as a two-decimal string, and each item as `title`,
+     `quantity`, and `unit_price` only
+   - `expiration_time: P1D`
+   - an `external_reference` derived from the idempotency key
+   - `integration_data` carrying this adapter's Platform ID
+7. Send the request through `sdk.order().create(...)` with that key as
+   `X-Idempotency-Key`.
+8. Validate the returned Order type, processing mode, initial status, ID, amount,
+   currency, reference, and HTTPS checkout URL, then return one `CheckoutHandoff`;
+   otherwise return `[]` so the host can use its fallback.
+
+Orders created by this package carry no payer PII, no return URL and no notification
+URL. The hosted checkout collects whatever it needs from the shopper.
+
+## Why the trusted catalog is mandatory
+
+A commerce-agents `Cart` is assembled through model tool calls. In the reference host,
+the session also travels in a raw `X-Session-Id` header. Forwarding `CartItem.price`
+would allow the conversation caller to choose the amount charged on the seller's
+account.
+
+This package therefore re-reads each product through
+`StorefrontBackend.get_product_details` and uses the catalog title, price, currency,
+explicit stock state, and the bounded quantity. The cart price is used only as proof of
+what the shopper confirmed; it never overrides the catalog. With no catalog or any
+drift, the package refuses to create an order.
+
+The host must still authenticate the shopper, verify ownership of the cart, and enforce
+its own inventory reservation and business rules. This library cannot turn an
+unauthenticated session header into an authenticated checkout.
+
+## Confirming payment
+
+A handoff means Mercado Pago created an order and returned a hosted checkout. It does not
+mean the buyer paid. Configure the **Order** webhook on your Mercado Pago application,
+then validate `x-signature`, deduplicate the event, fetch `/v1/orders/{id}`, and compare
+the authoritative amount, currency and `external_reference` against what you stored for
+that idempotency key before changing local state. A browser redirect is never payment
+evidence.
+
+The official SDK exposes `mercadopago.webhook.WebhookSignatureValidator`; Mercado Pago's
+[Webhooks guide](https://www.mercadopago.com.pe/developers/en/docs/your-integrations/notifications/webhooks)
+carries the current signature contract.
+
+## Local development
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -e . && .venv/bin/pip install pylint isort
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/pip install -e .
+.venv/bin/pip install pylint isort build twine
+
 .venv/bin/python -m unittest discover -s tests
+.venv/bin/pylint --max-line-length=100 src/mercadopago_commerce_agents examples
+.venv/bin/isort --check-only --diff src tests examples
 ```
 
-`tests/test_contract.py` is skipped unless commerce-agents is installed. To run it:
+`tests/test_contract.py` is skipped unless commerce-agents is installed. The CI job
+installs the exact pinned upstream commit and runs that contract test as a blocking
+check. See the
+[testing guide](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/testing.md)
+for both the pinned test and the opt-in real API test.
+
+## Real Checkout Pro test
+
+The repository includes an explicit, opt-in script that creates one test order, reads
+it back through Orders API, and prints its hosted Checkout Pro URL:
 
 ```bash
-git clone https://github.com/anthropics/commerce-agents.git
-.venv/bin/pip install ./commerce-agents/commerce-common ./commerce-agents/shopping-agent/core
-.venv/bin/python -m unittest tests.test_contract -v
+export MERCADOPAGO_TEST_ACCESS_TOKEN='seller-test-access-token'
+export MERCADOPAGO_TEST_BUYER_EMAIL='buyer@testuser.com'
+export MERCADOPAGO_TEST_CURRENCY='BRL'
+export MERCADOPAGO_LIVE_TEST_CONFIRM='create-order'
+.venv/bin/python examples/live_checkout.py
 ```
 
-It runs the real `enrich_checkout` against this package's `CheckoutHandoff`. That
-matters because declaring our own type is what keeps `shopping-agent-core` out of the
-dependency list, and commerce-agents accepts a handoff structurally rather than by a
-promised contract. If an upstream release starts validating the type, this test fails in
-CI instead of a seller's checkout failing in production. CI runs it against a pinned
-commit, plus weekly against upstream `main` as a non-blocking warning.
+Do not commit the token or paste it into tickets, logs, or chat. The generated order
+expires after `P1D`. Open the printed URL in a browser to verify that it reaches the
+Mercado Pago hosted checkout. With Orders API, the expected resource is an **order**,
+not a preference. Follow Mercado Pago's
+[integration-test guide](https://www.mercadopago.com.pe/developers/en/docs/checkout-pro-orders/integration-test-introduction)
+to obtain the seller test credential and buyer account exposed for your application.
+
+## Troubleshooting
+
+Every failure returns `[]` so the host's own checkout takes over, and the reason is
+logged under the `mercadopago_commerce_agents.checkout` logger. Enable it at `ERROR` and
+`WARNING` to see which gate rejected the handoff.
+
+| What you see | What it usually means |
+|---|---|
+| `Order creation failed (HTTP 403)` with Mercado Pago's `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | The catalog's currency does not match the seller account's own site currency. The error names a policy, never the currency, so it reads like a permissions problem. Confirm the site of the account behind the Access Token (BRL for MLB, ARS for MLA, ...) and pass exactly that. |
+| `Order creation failed (HTTP 409)` | The idempotency key was already used with a different payload. A new purchase needs a new key. |
+| `Order creation failed (HTTP 400)` | The request reached the account but failed schema validation. The logged `causes` are Mercado Pago's own codes; look them up in the Orders API reference. |
+| `Refusing to create an order: currency_mismatch` | The catalog records disagree with each other or with the cart — rejected locally, before any API call. |
+| `Refusing to create an order: cart_reconfirmation_required` | The catalog price moved after the shopper confirmed. Refresh the cart and ask for confirmation again; the library will not silently charge the new amount. |
+| `Refusing to create an order: out_of_stock` | The catalog record's `in_stock` is not boolean `True`. A truthy non-boolean (`1`, `"yes"`) fails this check on purpose. |
+| `Refusing to create an order: invalid_idempotency_key` | The supplied key was empty, oversized, or non-printable. The adapter fails closed rather than generating another one. |
+| The handoff succeeds but the hosted page's pay button stays disabled | This is browser-side, not the order. Mercado Pago's hosted checkout tokenizes the card in a cross-origin iframe; blocked third-party storage (`requestStorageAccessFor: Permission denied` in the console) prevents tokenization. Open the URL in a normal browser window that allows third-party cookies for Mercado Pago, and pay as a test user that is not the collector account. |
+
+Confirm an order independently of the agent flow with the Orders API directly:
+
+```python
+sdk.order().get(order_id)  # status "created" means payable, not paid
+```
+
+## Documentation
+
+- [Integration and payload contract](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/integration.md)
+- [Local, contract, and real API testing](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/testing.md)
+- [Security responsibilities and WebSec checklist](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/security.md)
+- [PyPI release procedure](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/releasing.md)
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE`.
+Apache License 2.0. See
+[LICENSE](https://github.com/mercadopago/commerce-agents-checkout/blob/main/LICENSE) and
+[NOTICE](https://github.com/mercadopago/commerce-agents-checkout/blob/main/NOTICE).

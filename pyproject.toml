@@ -1,15 +1,29 @@
 [build-system]
-requires = ["setuptools >= 77.0.0"]
+requires = ["setuptools == 80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# Provisional PyPI distribution name; confirm it before the first release.
 name = "mercadopago-commerce-agents"
 version = "0.1.0"
 authors = [{ name = "Mercado Pago", email = "mp_sdk@mercadopago.com" }]
-description = "Mercado Pago Checkout Pro as a checkout_handoff provider for commerce-agents"
+description = "Mercado Pago Checkout Pro via Orders API for commerce-agents"
 readme = "README.md"
-keywords = ["mercadopago", "checkout", "commerce-agents", "shopping-agent", "ai agents"]
+# Keep the distribution discoverable by product, framework and integration style.
+keywords = [
+    "mercadopago",
+    "mercado-pago",
+    "checkout",
+    "checkout-pro",
+    "checkout-handoff",
+    "checkout-url",
+    "commerce-agents",
+    "shopping-agent",
+    "agentic-commerce",
+    "ai-agents",
+    "orders-api",
+    "payments",
+    "python-sdk",
+]
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 # commerce-agents' own floor: shopping-agent-core declares requires-python >= 3.11.
@@ -21,14 +35,24 @@ dependencies = [
     # the wrong place to be generous about an untested range.
     "mercadopago>=3.5.0",
     # Used directly for its exception types when catching transport failures.
-    "requests",
+    "requests>=2.33.0,<3",
+    # Security floors for requests' transitive HTTP stack. Declaring them here also
+    # upgrades an already-installed but vulnerable version that still satisfies
+    # requests' intentionally broad compatibility ranges.
+    "certifi>=2024.7.4",
+    "idna>=3.15,<4",
+    "urllib3>=2.7.0,<3",
 ]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 # Deliberately NOT a dependency: shopping-agent-core. It is versioned 0.1.0.dev0 and
@@ -40,12 +64,17 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://www.mercadopago.com.br/developers"
+Documentation = "https://github.com/mercadopago/commerce-agents-checkout#readme"
+Issues = "https://github.com/mercadopago/commerce-agents-checkout/issues"
 Source = "https://github.com/mercadopago/commerce-agents-checkout"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+mercadopago_commerce_agents = ["py.typed"]
+
 [tool.isort]
 profile = "black"
 line_length = 100
-src_paths = ["src", "tests"]
+src_paths = ["src", "tests", "examples"]

@@ -312,6 +312,75 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
     # -- the remaining hardening --------------------------------------------------
 
+    # -- an order we refuse must not stay payable on the seller's account ----------
+
+    async def test_cancels_an_order_it_refuses_to_hand_over(self):
+        """The order exists at Mercado Pago even when validation fails afterwards."""
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "checkout_url": "https://evil.example.com/checkout",
+                "type": "online",
+                "processing_mode": "manual",
+                "status": "created",
+                "currency": "BRL",
+                "total_amount": body["total_amount"],
+                "external_reference": body["external_reference"],
+            }
+        )
+        sdk = mock.MagicMock()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(handoffs, [])
+        sdk.order.return_value.cancel.assert_called_once_with("ORD-1")
+
+    async def test_does_not_cancel_an_order_it_hands_over(self):
+        recorder = _Recorder()
+        sdk = mock.MagicMock()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(len(handoffs), 1)
+        sdk.order.return_value.cancel.assert_not_called()
+
+    async def test_a_failed_cancellation_still_falls_back_quietly(self):
+        """Cancellation is best effort: the handoff already failed either way."""
+        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        sdk = mock.MagicMock()
+        sdk.order.return_value.cancel.side_effect = RuntimeError("cancel exploded")
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
+            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(handoffs, [])
+        # The order id is logged so the seller can reconcile by hand, and the SDK's own
+        # exception text — which can carry request URLs — is not.
+        self.assertTrue(any("ORD-1" in line for line in logged.output))
+        self.assertFalse(any("cancel exploded" in line for line in logged.output))
+
+    async def test_an_unreadable_order_id_cannot_be_cancelled(self):
+        recorder = _Recorder(response=lambda body: {"id": None})
+        sdk = mock.MagicMock()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(handoffs, [])
+        sdk.order.return_value.cancel.assert_not_called()
+
+    async def test_a_cart_without_items_is_a_quiet_no_op(self):
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        for cart in (object(), SimpleNamespace(currency="BRL")):
+            with self.subTest(cart=cart):
+                self.assertEqual(await checkout.checkout_handoff(_Session(), cart), [])
+                self.assertEqual(recorder.calls, [])
+
     async def test_rejects_a_checkout_url_outside_mercadopago(self):
         """`checkout_url` is rendered as the official payment button, so a
         response pointing anywhere else is dropped rather than handed over."""

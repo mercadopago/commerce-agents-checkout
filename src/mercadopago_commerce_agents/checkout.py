@@ -132,12 +132,10 @@ class _Refused(Exception):
 class _PricedItem:  # pylint: disable=too-few-public-methods
     """A cart line resolved against the trusted catalog.
 
-    ``product_id`` is retained for retry identity but deliberately omitted from the
-    wire payload: Orders does not require ``external_code``, whose constraints are a
-    separate seller concern.
+    The product id is deliberately absent: Orders does not require ``external_code``,
+    whose constraints are a separate seller concern, and nothing else here needs it.
     """
 
-    product_id: str
     title: str
     quantity: int
     unit_price: Decimal
@@ -212,7 +210,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         every case that is not an order we are confident in: nothing to charge, a
         line that cannot be priced, an API rejection, or MP being unreachable.
         """
-        if not cart.items:
+        if not getattr(cart, "items", None):
             return []
         if idempotency_key is None:
             idempotency_key = str(uuid4())
@@ -254,6 +252,10 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             order, body["external_reference"], total_amount, currency
         )
         if checkout_url is None:
+            # The order exists at Mercado Pago even though we refuse to hand it over.
+            # Leaving it would strand a payable order on the seller's account for the
+            # whole expiry window, so cancel it before falling back.
+            await self._cancel(order.get("id"))
             return []
         # No adapter-specific label: the commerce-agents host owns its UI.
         return [CheckoutHandoff(url=checkout_url)]
@@ -326,7 +328,6 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 raise _Refused("invalid_title")
             items.append(
                 _PricedItem(
-                    product_id=product_id,
                     # The catalog's title, not the cart's: the cart's is model-authored
                     # text and this is rendered on an MP-branded page.
                     title=title,
@@ -377,6 +378,30 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             )
             return None
         return checkout_url
+
+    async def _cancel(self, order_id: Any) -> None:
+        """Best-effort cancellation of an order we created but refused to hand over.
+
+        Never raises and never changes the outcome: the handoff has already failed, and
+        the host's own checkout takes over either way. A cancellation that does not land
+        is logged with the order id so the seller can reconcile it by hand.
+        """
+        if not _valid_identifier(order_id):
+            logger.error("Refused an order whose id could not be read; cannot cancel it.")
+            return
+        try:
+            result = await asyncio.to_thread(self._sdk.order().cancel, order_id)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Same reasoning as _create: SDK errors can carry request URLs and headers.
+            logger.error("Could not cancel refused order %s.", _safe_str(order_id))
+            return
+        status = result.get("status") if isinstance(result, dict) else None
+        if not (isinstance(status, int) and 200 <= status < 300):
+            logger.error(
+                "Could not cancel refused order %s (HTTP %s).", _safe_str(order_id), status
+            )
+            return
+        logger.info("Cancelled refused order %s.", _safe_str(order_id))
 
     async def _create(
         self,

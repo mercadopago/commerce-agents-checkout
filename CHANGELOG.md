@@ -48,13 +48,23 @@ await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
   headers do not populate it, so attribution has to travel in the body. It is a constant,
   not an argument: attribution must not depend on host configuration.
   *Changes the request sent to Mercado Pago; public surface change.*
-- Troubleshooting guidance mapping Mercado Pago's opaque `403`
-  `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` to a seller-currency mismatch, plus the local
-  refusal reason codes and the disabled hosted-checkout button.
+- Troubleshooting guidance for Mercado Pago's opaque `403`
+  `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` (the account is not authorised for the Orders
+  API), for a catalog priced in a currency the seller account does not use, for the local
+  refusal reason codes, and for the disabled hosted-checkout button.
 - A concrete reference implementation for `attempt_id_provider` in the README.
 - This changelog and a security policy.
 
 ### Fixed
+
+- Cancel an order that fails post-creation validation. The order exists at Mercado Pago by
+  the time the response is checked, so refusing the handoff used to strand a payable order
+  on the seller's account for the full expiry window — including the case where the catalog
+  is priced in a currency the account does not use, which Mercado Pago accepts and creates
+  in its own currency. Found by exercising the real API rather than a mock.
+  *Changes behaviour on every refusal that happens after creation.*
+- Guard `cart.items` so a malformed cart returns `[]` like every other refusal instead of
+  raising out of the adapter.
 
 - Corrected `integration_data`. The previous `product`/`technology` shape was rejected
   outright, failing every real order with `HTTP 400`; verified against the live API,

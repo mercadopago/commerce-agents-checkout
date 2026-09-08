@@ -111,6 +111,12 @@ The accepted URL becomes:
 [CheckoutHandoff(url=checkout_url)]
 ```
 
+When that validation fails the order has already been created, so the adapter cancels it
+through `sdk.order().cancel(order_id)` before returning `[]`. Cancellation is best effort:
+if it does not land, the order id is logged at `ERROR` so the seller can reconcile by
+hand, and the handoff still falls back. An order whose id could not even be read cannot be
+cancelled — that case is logged too.
+
 The order ID is the authoritative resource identifier for status lookup, cancellation,
 refunds, and Order webhooks. The Orders API flow does not create or return a preference
 or `init_point`. Production hosts should persist their idempotency key before calling,

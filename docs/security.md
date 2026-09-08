@@ -23,7 +23,8 @@ confirm payment.
   stack while retaining compatible version ranges.
 - Logs omit credentials, sessions, product identifiers, prices, payloads, full API
   responses, and checkout URLs.
-- The created Order's ID, reference, amount, and currency are validated before handoff.
+- The created Order's ID, reference, amount, and currency are validated before handoff;
+  an order that fails that check is cancelled rather than left payable on the account.
 - No card data, return URL, notification URL, or payer PII is sent at all.
 
 ## Responsibilities of the host application

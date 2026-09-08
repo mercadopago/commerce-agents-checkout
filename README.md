@@ -114,6 +114,9 @@ handoffs = await checkout.checkout_handoff(
 - One key means one operation. A new purchase needs a new key, and Mercado Pago answers a
   reused key carrying a different payload with `HTTP 409 idempotency_key_already_used`.
 - The key is never derived from the session id, an email, or any personal data.
+- Prefer a high-entropy key. `external_reference` is a deterministic UUIDv5 of it, so a
+  guessable key (a sequential order number, say) could be matched back to your internal
+  identifier by anyone who can see the seller's Mercado Pago records.
 
 Automatic generation only covers the current call. Idempotency across calls, processes or
 restarts means your backend supplying the same key again.
@@ -149,8 +152,10 @@ callback from this library. It never contains the session id.
 7. Send the request through `sdk.order().create(...)` with that key as
    `X-Idempotency-Key`.
 8. Validate the returned Order type, processing mode, initial status, ID, amount,
-   currency, reference, and HTTPS checkout URL, then return one `CheckoutHandoff`;
-   otherwise return `[]` so the host can use its fallback.
+   currency, reference, and HTTPS checkout URL, then return one `CheckoutHandoff`.
+9. If that validation fails, cancel the order before returning `[]`. It already exists at
+   Mercado Pago, and leaving it would strand a payable order on the seller's account for
+   the whole expiry window.
 
 Orders created by this package carry no payer PII, no return URL and no notification
 URL. The hosted checkout collects whatever it needs from the shopper.
@@ -232,9 +237,10 @@ logged under the `mercadopago_commerce_agents.checkout` logger. Enable it at `ER
 
 | What you see | What it usually means |
 |---|---|
-| `Order creation failed (HTTP 403)` with Mercado Pago's `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | The catalog's currency does not match the seller account's own site currency. The error names a policy, never the currency, so it reads like a permissions problem. Confirm the site of the account behind the Access Token (BRL for MLB, ARS for MLA, ...) and pass exactly that. |
+| `Order creation failed (HTTP 403)` with Mercado Pago's `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | The account behind the Access Token is not authorised for the Orders API. It is a policy decision taken before the payload is validated, so it says nothing about the request itself — check that the application has Checkout Pro through Orders enabled for that account. |
 | `Order creation failed (HTTP 409)` | The idempotency key was already used with a different payload. A new purchase needs a new key. |
 | `Order creation failed (HTTP 400)` | The request reached the account but failed schema validation. The logged `causes` are Mercado Pago's own codes; look them up in the Orders API reference. |
+| Handoff returns `[]` right after `Order ... did not match the confirmed checkout snapshot` | The catalog's currency is not the seller account's own. Mercado Pago accepts the order and creates it in the account's currency (it is never sent), so the mismatch is only caught on the response — the adapter then cancels that order and falls back. Price the catalog in the account's currency (BRL for MLB, ARS for MLA, ...). |
 | `Refusing to create an order: currency_mismatch` | The catalog records disagree with each other or with the cart — rejected locally, before any API call. |
 | `Refusing to create an order: cart_reconfirmation_required` | The catalog price moved after the shopper confirmed. Refresh the cart and ask for confirmation again; the library will not silently charge the new amount. |
 | `Refusing to create an order: out_of_stock` | The catalog record's `in_stock` is not boolean `True`. A truthy non-boolean (`1`, `"yes"`) fails this check on purpose. |

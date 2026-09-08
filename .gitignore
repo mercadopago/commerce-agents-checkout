@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local integration checkout used by the contract test instructions
+commerce-agents/
+
+# macOS metadata
+.DS_Store

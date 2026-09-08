@@ -1,0 +1,15 @@
+mercadopago-commerce-agents
+Copyright 2026 Mercado Pago
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+This package contains no code from anthropics/commerce-agents. It targets that
+project's StorefrontBackend interface and, in src/mercadopago_commerce_agents/types.py,
+declares a type that is structurally compatible with
+shopping_agent.types.CheckoutHandoff so that the unpublished shopping-agent-core
+distribution is not required at install time.
+
+anthropics/commerce-agents is licensed under the Apache License, Version 2.0.
+Apache-2.0 section 6 grants no trademark rights: this package is not endorsed by or
+affiliated with Anthropic, and "Claude" and "Anthropic" are used here only to identify
+the upstream project.

@@ -1,4 +1,4 @@
-# Security responsibilities and WebSec checklist
+# Security responsibilities and review checklist
 
 This package sits on a payment boundary. A successful `checkout_handoff` only creates a
 hosted Mercado Pago order; it does not authenticate a shopper, reserve inventory, or
@@ -50,7 +50,7 @@ confirm payment.
 - Compare the authoritative amount/reference before changing local order state.
 - Treat redirects as navigation only, never proof of payment.
 
-## WebSec validation checklist
+## Security review checklist
 
 - [ ] Threat model the host-to-library-to-Mercado-Pago data flow.
 - [ ] Confirm the session identity and cart ownership implementation in the host.
@@ -65,11 +65,12 @@ confirm payment.
 - [ ] Confirm logs and monitoring never persist tokens, session IDs, PII, financial
       payloads, or complete checkout URLs.
 - [ ] Run dependency/SAST scanning against the release artifact.
-- [ ] Obtain formal WebSec approval before production enablement.
+- [ ] Obtain security approval before production enablement.
 
 Security reports should review the consuming host as well as this library; reviewing the
 adapter alone cannot establish authentication, authorization, or payment correctness.
 
-This is a public PyPI package, so it does not depend on internal MELI HTTP/logging
-libraries. It also avoids a runtime Pydantic dependency; its small external boundary is
-validated explicitly with bounded inputs and exercised by the hostile-input tests.
+The package keeps its dependency surface small on purpose: the official Mercado Pago SDK
+for transport, the standard library for everything else, and no runtime Pydantic. Its
+external boundary is validated explicitly with bounded inputs and exercised by the
+hostile-input tests.

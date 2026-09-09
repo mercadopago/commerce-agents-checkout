@@ -6,18 +6,14 @@ and take priority over feature work.
 
 ## Reporting a vulnerability
 
-> **Maintainers: confirm this channel before the first public release.** Replace the line
-> below with Mercado Pago's official vulnerability-disclosure address or program URL. Do
-> not leave a placeholder in a published package.
+Report privately through Mercado Pago's security disclosure channel. Do **not** open a
+public GitHub issue, pull request, or discussion for a suspected vulnerability, and do not
+include a real Access Token, a complete `checkout_url`, or any buyer data in a report.
 
-Report privately to Mercado Pago's security disclosure channel. Do **not** open a public
-GitHub issue, pull request, or discussion for a suspected vulnerability, and do not
-include a real Access Token, a complete `checkout_url`, or any buyer data in the report.
-
-> Private vulnerability reporting is **not** enabled on this repository today
-> (`GET /repos/.../private-vulnerability-reporting` returns 404). Either enable it and
-> restore this paragraph, or leave it out — do not advertise a channel that does not
-> answer.
+<!-- Maintainers, before the first public release: replace the sentence above with the
+     official disclosure address or program URL, and decide whether to enable GitHub
+     private vulnerability reporting for this repository (it is not enabled today). This
+     comment does not render on GitHub or PyPI. -->
 
 Please include:
 

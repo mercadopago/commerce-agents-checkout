@@ -28,10 +28,10 @@ That is the whole integration: two arguments and one method. What you get for it
 - **Nothing to run or store.** No webhook server, no database, no background job inside
   this library — it creates one order and returns one URL.
 
-> **Pre-release repository.** Not yet published to PyPI. The Orders API flow has been
-> exercised end to end against the real API — an order is created, read back, and its
-> hosted Checkout Pro URL opens — but completing a payment on that hosted page and the
-> WebSec review are still open. Use dedicated test users until both are done.
+> **Pre-release.** Not yet published to PyPI, and not yet approved for production
+> traffic. Creating an order and opening its hosted checkout has been exercised against
+> the live API; completing a payment there has not. Use test users until the first
+> release.
 
 ## Requirements
 
@@ -163,11 +163,9 @@ reconcilable.
 
 ## How it talks to Mercado Pago
 
-This version uses `POST /v1/orders` with `processing_mode=manual`. It never calls
-`POST /checkout/preferences`, and the resource it creates — the one to look up, cancel or
-reconcile — is the **order**. Mercado Pago still mints a preference behind it, visible as
-the `pref_id` inside the returned `checkout_url`, but that is an implementation detail of
-the hosted page.
+`POST /v1/orders` with `processing_mode=manual`. The resource it creates — the one to look
+up, cancel or reconcile — is the **order**; the `pref_id` that appears inside the returned
+`checkout_url` belongs to the hosted page and is not something to build on.
 
 ## What happens during `checkout_handoff`
 
@@ -331,8 +329,7 @@ sdk.order().get(order_id)  # status "created" means payable, not paid
 
 - [Integration and payload contract](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/integration.md)
 - [Local, contract, and real API testing](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/testing.md)
-- [Security responsibilities and WebSec checklist](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/security.md)
-- [PyPI release procedure](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/releasing.md)
+- [Security responsibilities and review checklist](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/security.md)
 
 ## License
 

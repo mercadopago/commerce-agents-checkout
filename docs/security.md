@@ -45,6 +45,8 @@ confirm payment.
 - Keep Access Tokens and webhook secrets in an approved secrets manager.
 - Apply rate limits and abuse detection before calling `checkout_handoff`.
 - Validate Order webhook `x-signature`, deduplicate events, and retrieve the order by ID.
+  The signature contract is in Mercado Pago's
+  [Webhooks guide](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks).
 - Compare the authoritative amount/reference before changing local order state.
 - Treat redirects as navigation only, never proof of payment.
 

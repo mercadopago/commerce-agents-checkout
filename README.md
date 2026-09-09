@@ -219,6 +219,35 @@ The host must still authenticate the shopper, verify ownership of the cart, and 
 its own inventory reservation and business rules. This library cannot turn an
 unauthenticated session header into an authenticated checkout.
 
+## What the seller configures
+
+This package does one thing — turn a validated cart into a hosted checkout URL. Everything
+below is configured on the Mercado Pago side, by the seller, and every row links to Mercado
+Pago's own documentation so nobody has to take our word for it.
+
+| What | Why you need it | Mercado Pago documentation |
+|---|---|---|
+| Application and Access Token | The credential this package's SDK instance carries. Its account decides the site and therefore the currency. | [Credentials](https://www.mercadopago.com/developers/en/docs/your-integrations/credentials) · [Developer panel](https://www.mercadopago.com/developers/panel/app) |
+| Checkout Pro through Orders enabled | `POST /v1/orders` answers `403 PA_UNAUTHORIZED_RESULT_FROM_POLICIES` for an account that is not authorised for it, before it even validates the payload. | [Create a Checkout Pro order](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/create-order) · [API reference](https://www.mercadopago.com.pe/developers/en/reference/online-payments/checkout-pro/create-order/post) |
+| **Order webhook** | **How you learn a shopper actually paid.** This library returns a URL and stops; nothing here polls or notifies. Configure the notification on the application, then validate the `x-signature` header, deduplicate the event and re-fetch the order before trusting it. | [Webhooks and signature validation](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks) · [IPN, the older mechanism](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/ipn) |
+| Test users | A test seller and a test buyer must belong to the **same application**, or the hosted page refuses with "one of the parties is a test user". | [Test accounts](https://www.mercadopago.com/developers/en/docs/your-integrations/test/accounts) |
+| Test cards | Completing a payment on the hosted page during integration testing. | [Test cards](https://www.mercadopago.com/developers/en/docs/your-integrations/test/cards) · [Integration test guide](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/integration-test-introduction) |
+
+### Checkout options this package does not send
+
+The order it creates carries the items, the amount, an opaque reference and a 24-hour
+expiry — nothing else. These are all supported by the Orders API and are **not** exposed
+here, so the account defaults apply. If a seller needs them, that is a scope decision to
+make deliberately, not something to discover in production:
+
+| Not sent | Consequence today | Reference |
+|---|---|---|
+| `back_urls` / `auto_return` | The shopper stays on Mercado Pago's page after paying instead of returning to the store. | [Create a Checkout Pro order](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/create-order) |
+| Installments (`max_installments`, interest-free ranges) | The account's default installment policy applies. | idem |
+| `statement_descriptor` | What the buyer sees on the card statement is the account default. | idem |
+| `shipment` (cost, address) | Shipping is not charged; the total is the sum of catalog lines only. | idem |
+| `payer` details, `additional_info` | The hosted checkout collects what it needs. Richer payer data feeds Mercado Pago's fraud scoring, so omitting it can raise rejection rates. | idem |
+
 ## Confirming payment
 
 A handoff means Mercado Pago created an order and returned a hosted checkout. It does not
@@ -228,9 +257,13 @@ the authoritative amount, currency and `external_reference` against what you sto
 that idempotency key before changing local state. A browser redirect is never payment
 evidence.
 
-The official SDK exposes `mercadopago.webhook.WebhookSignatureValidator`; Mercado Pago's
-[Webhooks guide](https://www.mercadopago.com.pe/developers/en/docs/your-integrations/notifications/webhooks)
-carries the current signature contract.
+The official SDK exposes `mercadopago.webhook.WebhookSignatureValidator`. The current
+signature contract, the `x-signature` header format and the list of notification topics
+live in Mercado Pago's
+[Webhooks guide](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks);
+subscribe to the **Order** topic for this flow. The older
+[IPN](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/ipn)
+mechanism is documented separately if an existing integration still uses it.
 
 ## Local development
 

@@ -179,7 +179,16 @@ The host must validate the Order webhook signature, deduplicate the event, fetch
 idempotency key, verify the expected amount and currency, and then apply a valid local
 state transition. Browser redirects and query parameters are never payment evidence.
 
+What the seller configures on the Mercado Pago side — credentials, the Order webhook,
+test users — is listed with links in the README under "What the seller configures".
+
 Current Mercado Pago references:
 
-- [Create a Checkout Pro order](https://www.mercadopago.com.pe/developers/en/docs/checkout-pro-orders/create-order)
+- [Create a Checkout Pro order](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/create-order)
 - [Checkout Pro Orders API reference](https://www.mercadopago.com.pe/developers/en/reference/online-payments/checkout-pro/create-order/post)
+  (the API reference only resolves under a country subdomain; the guides also work on the
+  neutral one)
+- [Webhooks and signature validation](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks)
+- [Credentials](https://www.mercadopago.com/developers/en/docs/your-integrations/credentials)
+- [Test accounts](https://www.mercadopago.com/developers/en/docs/your-integrations/test/accounts)
+  and [test cards](https://www.mercadopago.com/developers/en/docs/your-integrations/test/cards)

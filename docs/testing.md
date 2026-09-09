@@ -32,6 +32,12 @@ REQUIRE_COMMERCE_AGENTS=1 \
 
 Use a disposable path of your choice instead of `/tmp/commerce-agents` when necessary.
 
+## Integration example
+
+`examples/seller_integration.py` is the readable one: a catalog, a backend, the wiring and
+a sketch of the webhook reconciliation. It prints the wiring with no credentials, and
+creates one order with `--create` and a test-seller token.
+
 ## Real Orders API and Checkout Pro test
 
 This test performs an external write: it creates one Mercado Pago test order for

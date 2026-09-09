@@ -93,7 +93,14 @@ class MyBackend(StorefrontBackend):
 ```
 
 `MyBackend` is the `StorefrontBackend` commerce-agents already requires you to write —
-this adds one method to it. The public surface is two constructor arguments and one
+this adds one method to it. For a complete file you can read top to bottom and run,
+including what to do with the webhook afterwards, see
+[`examples/seller_integration.py`](https://github.com/mercadopago/commerce-agents-checkout/blob/main/examples/seller_integration.py):
+
+```bash
+python examples/seller_integration.py            # print the wiring and exit
+python examples/seller_integration.py --create   # create one order against a test seller
+``` The public surface is two constructor arguments and one
 per-call option:
 
 ```text

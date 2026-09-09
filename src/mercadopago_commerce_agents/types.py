@@ -1,7 +1,7 @@
 # Copyright 2026 Mercado Pago
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public handoff and persistence values without an Anthropic runtime dependency.
+"""The one type this package hands back, without an Anthropic runtime dependency.
 
 ``shopping_agent.types.CheckoutHandoff`` is a three-field pydantic model, and the only
 thing the shopping agent ever does with a handoff is call ``.model_dump(exclude_none=True)``
@@ -40,11 +40,18 @@ class CheckoutHandoff:
     label: str | None = None
     seller: str | None = None
 
-    def model_dump(self, *, exclude_none: bool = False, **_: Any) -> dict[str, Any]:
-        """Mirrors the pydantic method ``enrich_checkout`` calls. ``**_`` swallows the
-        other pydantic keywords (``mode``, ``by_alias``, ...) so a future upstream call
-        that passes one does not raise here — it would be reported by the contract test
-        instead, which is the failure mode we want."""
+    def model_dump(self, *, exclude_none: bool = False, **unsupported: Any) -> dict[str, Any]:
+        """Mirrors the pydantic method ``enrich_checkout`` calls.
+
+        Only ``exclude_none`` is implemented. Silently accepting the other pydantic
+        keywords (``exclude``, ``by_alias``, ``mode``, ...) would let an upstream release
+        change the meaning of a handoff while the contract test stayed green, so anything
+        else raises and the contract test fails loudly instead."""
+        if unsupported:
+            raise TypeError(
+                "model_dump() received unsupported keyword arguments: "
+                + ", ".join(sorted(unsupported))
+            )
         dumped = asdict(self)
         if exclude_none:
             return {key: value for key, value in dumped.items() if value is not None}

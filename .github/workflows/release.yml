@@ -117,7 +117,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/mercadopago-commerce-agents
+      url: https://test.pypi.org/p/mercadopago-commerce-agents-checkout
     permissions:
       id-token: write
     steps:
@@ -127,17 +127,30 @@ jobs:
           name: python-package-distributions
           path: dist/
 
+      # Trusted Publishing without a third-party action: mint a short-lived token from
+      # the workflow's own OIDC identity, then upload with twine. Organization policy
+      # permits official actions and native commands; an unapproved third-party action
+      # is what it excludes.
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
+        env:
+          TWINE_NON_INTERACTIVE: "1"
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade "twine==6.2.0"
+          oidc=$(curl -fsSL \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=testpypi" | python -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          token=$(curl -fsSL -X POST https://test.pypi.org/_/oidc/mint-token \
+            -d "{\"token\":\"${oidc}\"}" | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          TWINE_USERNAME=__token__ TWINE_PASSWORD="${token}" \
+            python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
 
   publish-pypi:
     needs: publish-testpypi
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/mercadopago-commerce-agents
+      url: https://pypi.org/p/mercadopago-commerce-agents-checkout
     permissions:
       id-token: write
     steps:
@@ -148,4 +161,15 @@ jobs:
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        env:
+          TWINE_NON_INTERACTIVE: "1"
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade "twine==6.2.0"
+          oidc=$(curl -fsSL \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" | python -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          token=$(curl -fsSL -X POST https://pypi.org/_/oidc/mint-token \
+            -d "{\"token\":\"${oidc}\"}" | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          TWINE_USERNAME=__token__ TWINE_PASSWORD="${token}" \
+            python -m twine upload dist/*

@@ -14,8 +14,10 @@ Report privately to Mercado Pago's security disclosure channel. Do **not** open 
 GitHub issue, pull request, or discussion for a suspected vulnerability, and do not
 include a real Access Token, a complete `checkout_url`, or any buyer data in the report.
 
-GitHub private vulnerability reporting is also enabled on this repository and is an
-acceptable channel: use **Security → Report a vulnerability**.
+> Private vulnerability reporting is **not** enabled on this repository today
+> (`GET /repos/.../private-vulnerability-reporting` returns 404). Either enable it and
+> restore this paragraph, or leave it out — do not advertise a channel that does not
+> answer.
 
 Please include:
 

@@ -16,9 +16,9 @@ before upgrading.
 Review feedback on the public API: the package is now the smallest thing that turns a
 catalog-validated cart into a hosted checkout URL. The surface is
 
-```python
+```text
 MercadoPagoCheckout(*, sdk, catalog)
-await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
+checkout_handoff(session, cart, *, idempotency_key=None)
 ```
 
 - Removed `currency`. It is derived from the trusted catalog instead, which removes a
@@ -52,7 +52,6 @@ await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
   `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` (the account is not authorised for the Orders
   API), for a catalog priced in a currency the seller account does not use, for the local
   refusal reason codes, and for the disabled hosted-checkout button.
-- A concrete reference implementation for `attempt_id_provider` in the README.
 - This changelog and a security policy.
 
 ### Fixed
@@ -81,9 +80,9 @@ await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
   validates with `additionalProperties: false` and rejected both; an item now carries
   `title`, `quantity`, and `unit_price` only. *Changes the request sent to Mercado Pago.*
 
-## [0.1.0] - Unreleased
+### Notes
 
-Initial implementation: Mercado Pago Checkout Pro as a `checkout_handoff` provider for
+The first release consolidates everything above with the initial implementation: Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 [anthropics/commerce-agents](https://github.com/anthropics/commerce-agents), built on
 `POST /v1/orders` with `processing_mode=manual`.
 

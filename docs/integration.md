@@ -13,10 +13,9 @@ the model call has completed.
 
 ## Public surface
 
-```python
+```text
 MercadoPagoCheckout(*, sdk: mercadopago.SDK, catalog: Catalog)
-
-await checkout.checkout_handoff(session, cart, *, idempotency_key: str | None = None)
+checkout_handoff(session, cart, *, idempotency_key: str | None = None)
 ```
 
 - `sdk` must already contain a backend Access Token.
@@ -30,9 +29,11 @@ await checkout.checkout_handoff(session, cart, *, idempotency_key: str | None = 
   Mercado Pago with `HTTP 409 idempotency_key_already_used`.
 
 The adapter does not own authentication, secrets management, persistence, reconciliation
-or webhook delivery, and exposes no callbacks for them. A host correlates a webhook
-through the `external_reference`, which is a UUIDv5 of the idempotency key it already
-holds.
+or webhook delivery, and exposes no callbacks for them. A host correlates a webhook through
+`external_reference_for(key)`, a public helper that returns exactly what the adapter sent:
+`"mpca-" + str(uuid.uuid5(uuid.NAMESPACE_URL, key))`. Index your own record by that value.
+When the key is generated internally the caller never sees it, so that call cannot be
+correlated — pass your own key whenever the Order must be reconcilable.
 
 ## Orders API request
 
@@ -136,7 +137,10 @@ The method returns `[]` without creating an order when:
 - a catalog price is non-positive, non-finite, or has more than two decimals;
 - the catalog records disagree on currency, or the cart disagrees with them;
 - the cart price differs from the catalog price and needs shopper reconfirmation;
-- Mercado Pago rejects the request or cannot be reached;
+- the same product appears on more than one line;
+- the order total cannot be represented as a two-decimal amount;
+- Mercado Pago rejects the request, or stays unreachable across two attempts with the
+  same key;
 - the response does not match the confirmed snapshot or contain a valid Order ID and
   Mercado Pago `checkout_url`.
 
@@ -154,7 +158,8 @@ minor version bump and a changelog entry:
 - the reason codes themselves — `currency_mismatch`,
   `too_many_items`, `invalid_product_id`, `product_not_found`, `out_of_stock`,
   `invalid_price`, `invalid_currency`, `invalid_quantity`, `cart_reconfirmation_required`,
-  `invalid_title`, and `invalid_idempotency_key`.
+  `invalid_title`, `duplicate_product`, `amount_out_of_range`, `unreadable_cart`,
+  and `invalid_idempotency_key`.
 
 A local refusal is logged at `WARNING` as `Refusing to create an order: <code>`; a
 Mercado Pago rejection or an infrastructure failure is logged at `ERROR`. Attach a

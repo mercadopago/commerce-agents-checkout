@@ -78,6 +78,10 @@ _MAX_TITLE = 256
 _MAX_CART_ITEMS = 20
 _MAX_QUANTITY = 10
 _MAX_IDENTIFIER = 256
+# mercadopago 3.5.0 rejects a longer x-idempotency-key when RequestOptions is built,
+# which would raise out of the adapter instead of failing closed.
+_MAX_IDEMPOTENCY_KEY = 64
+_IDEMPOTENCY_HEADER = "x-idempotency-key"
 _MAX_CHECKOUT_URL = 2048
 _MAX_DECIMAL_TEXT = 64
 _AMOUNT_QUANTUM = Decimal("0.01")
@@ -123,9 +127,40 @@ class Catalog(Protocol):  # pylint: disable=too-few-public-methods
         returns that variant."""
 
 
+_UNREACHABLE = object()
+"""A transport failure: the request may or may not have reached Mercado Pago."""
+
+_FAILED = object()
+"""The SDK raised something other than a transport error; already logged."""
+
+
 class _Refused(Exception):
     """A line that cannot be priced honestly. Aborts the handoff; the host's own
     checkout card takes over."""
+
+
+@dataclass(frozen=True)
+class _CartLine:
+    """One cart line, copied out of the caller's object before anything is awaited."""
+
+    product_id: Any
+    price: Any
+    quantity: Any
+
+
+@dataclass(frozen=True)
+class _CartSnapshot:
+    """The confirmed cart, frozen at entry.
+
+    The cart belongs to the caller and stays mutable while this coroutine awaits the
+    catalog. Reading it again after an ``await`` would let a line, a quantity or the
+    currency change between validation and the payload — and iterating it live lets a
+    catalog that appends to it loop forever past the size cap. Everything is copied
+    once, up front, and only this snapshot is used afterwards.
+    """
+
+    lines: tuple[_CartLine, ...]
+    currency: Any
 
 
 @dataclass(frozen=True)
@@ -210,18 +245,19 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         every case that is not an order we are confident in: nothing to charge, a
         line that cannot be priced, an API rejection, or MP being unreachable.
         """
-        if not getattr(cart, "items", None):
+        snapshot = _snapshot(cart)
+        if snapshot is None or not snapshot.lines:
             return []
         if idempotency_key is None:
             idempotency_key = str(uuid4())
-        elif not _valid_identifier(idempotency_key):
+        elif not _valid_idempotency_key(idempotency_key):
             # Fail closed: generating a replacement here would create an order the
             # caller believes it already deduplicated.
             logger.warning("Refusing to create an order: invalid_idempotency_key")
             return []
 
         try:
-            items, currency = await self._priced_items(session, cart)
+            items, currency = await self._priced_items(session, snapshot)
         except _Refused as refusal:
             logger.warning("Refusing to create an order: %s", refusal)
             return []
@@ -232,6 +268,9 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             return []
 
         total_amount = _order_total(items)
+        if total_amount is None:
+            logger.warning("Refusing to create an order: amount_out_of_range")
+            return []
         body: dict[str, Any] = {
             "type": "online",
             "processing_mode": "manual",
@@ -263,27 +302,28 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
     # -- internals ---------------------------------------------------------------
 
     async def _priced_items(  # pylint: disable=too-many-branches
-        self, session: "ShoppingSessionContext", cart: "Cart"
+        self, session: "ShoppingSessionContext", snapshot: _CartSnapshot
     ) -> tuple[list[_PricedItem], str]:
         """One order item per cart line, priced from the catalog record rather than
         from the line, plus the currency those records agree on.
 
-        The currency is derived here rather than configured: the trusted catalog is
-        already the authority for price, so making it the authority for currency too
-        removes a second source of truth. Every record must agree with the first one and
-        with the cart, and the created Order is checked against the same value.
+        Reads only the frozen snapshot: the caller's cart may change while this awaits.
 
         Raises :class:`_Refused` on anything that cannot be priced.
         """
-        if len(cart.items) > _MAX_CART_ITEMS:
-            raise _Refused("too_many_items")
-
         items: list[_PricedItem] = []
         currency: str | None = None
-        for line in cart.items:
-            product_id = getattr(line, "product_id", None)
+        seen: set[str] = set()
+        for line in snapshot.lines:
+            product_id = line.product_id
             if not _valid_identifier(product_id):
                 raise _Refused("invalid_product_id")
+            if product_id in seen:
+                # The caps below are per line, so the same product spread over several
+                # lines would multiply past them. Aggregating silently would change what
+                # the shopper confirmed, so this is a refusal.
+                raise _Refused("duplicate_product")
+            seen.add(product_id)
             record = await self._catalog.get_product_details(session, product_id)
             if record is None:
                 raise _Refused("product_not_found")
@@ -336,9 +376,9 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 )
             )
 
-        if currency is None:  # unreachable: an empty cart returns before this
+        if currency is None:  # unreachable: an empty snapshot returns before this
             raise _Refused("invalid_currency")
-        if getattr(cart, "currency", None) != currency:
+        if snapshot.currency != currency:
             raise _Refused("currency_mismatch")
         return items, currency
 
@@ -361,13 +401,23 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 _safe_str(order_id),
             )
             return None
-        expected_state = ("online", "manual", "created", reference, currency)
+        expected_state = (
+            "online",
+            "manual",
+            "created",
+            reference,
+            currency,
+            _ORDER_EXPIRATION,
+        )
         returned_state = (
             order.get("type"),
             order.get("processing_mode"),
             order.get("status"),
             order.get("external_reference"),
             order.get("currency"),
+            # The 24-hour window is what stops a stale link being paid at an old price,
+            # so an order that came back without it is not the order we asked for.
+            order.get("expiration_time"),
         )
         if returned_state != expected_state or _money(
             order.get("total_amount")
@@ -410,26 +460,46 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
     ) -> dict[str, Any] | None:
         """The API call. Uses the official SDK, which also means the base URL is not
         configurable here — it is a private constant in ``mercadopago.config.Config`` —
-        so the seller's credential cannot be pointed at another host by configuration."""
-        # RequestOptions is mutable and shared by an SDK instance. Clone it (including
-        # current and future SDK-level settings) and clone its headers before adding the
-        # request-scoped idempotency key.
-        options = copy(self._sdk.request_options)
-        custom_headers = dict(options.custom_headers or {})
-        custom_headers["x-idempotency-key"] = idempotency_key
-        options.custom_headers = custom_headers
+        so the seller's credential cannot be pointed at another host by configuration.
+
+        A transport failure does not prove the POST had no effect, so it is retried once
+        with the same key and the same body. Mercado Pago replays an identical request
+        instead of duplicating it: the retry either creates the order or returns the one
+        the lost response described. Both attempts failing is the residual window, and it
+        is logged with the reference so the host can reconcile.
+        """
         try:
-            # The SDK is synchronous (requests); keep the event loop free.
-            result = await asyncio.to_thread(self._sdk.order().create, body, options)
-        except requests.RequestException:
+            # RequestOptions is mutable and shared by an SDK instance. Clone it (including
+            # current and future SDK-level settings) and clone its headers before adding
+            # the request-scoped idempotency key. Building the options can itself raise —
+            # the SDK bounds the header — so it stays inside the handled boundary.
+            options = copy(self._sdk.request_options)
+            # Drop any inherited spelling first: requests matches headers
+            # case-insensitively, so a lingering `X-Idempotency-Key` could otherwise win
+            # on the wire while `external_reference` derives from this call's key.
+            custom_headers = {
+                name: value
+                for name, value in (options.custom_headers or {}).items()
+                if name.lower() != _IDEMPOTENCY_HEADER
+            }
+            custom_headers[_IDEMPOTENCY_HEADER] = idempotency_key
+            options.custom_headers = custom_headers
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.error("Could not prepare the request; checkout was not created.")
+            return None
+
+        result = await self._post_once(body, options)
+        if result is _UNREACHABLE:
+            logger.warning("Mercado Pago was unreachable; retrying the same request once.")
+            result = await self._post_once(body, options)
+        if result is _UNREACHABLE:
             logger.error(
-                "Mercado Pago was unreachable; the host's own checkout card takes over."
+                "Mercado Pago stayed unreachable for reference %s. An order may exist; "
+                "reconcile it by that reference before charging again.",
+                _safe_str(body.get("external_reference")),
             )
             return None
-        except Exception:  # pylint: disable=broad-exception-caught
-            # SDK errors can contain request URLs and headers. Keep the fallback safe
-            # and avoid propagating or logging those details through the host.
-            logger.error("Unexpected Mercado Pago SDK failure; checkout was not created.")
+        if result is _FAILED:
             return None
 
         if not isinstance(result, dict):
@@ -459,6 +529,22 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             return None
         return payload
 
+    async def _post_once(self, body: dict[str, Any], options: Any) -> Any:
+        """One attempt. ``_UNREACHABLE`` marks a transport failure, which may still have
+        reached Mercado Pago and is therefore safe to replay with the same key."""
+        try:
+            # The SDK is synchronous (requests); keep the event loop free. Note that
+            # cancelling this coroutine does not cancel the thread: the POST may still
+            # land, which is another reason the key must stay stable.
+            return await asyncio.to_thread(self._sdk.order().create, body, options)
+        except requests.RequestException:
+            return _UNREACHABLE
+        except Exception:  # pylint: disable=broad-exception-caught
+            # SDK errors can contain request URLs and headers. Keep the fallback safe
+            # and avoid propagating or logging those details through the host.
+            logger.error("Unexpected Mercado Pago SDK failure; checkout was not created.")
+            return _FAILED
+
     @staticmethod
     def _is_checkout_url(url: str) -> bool:
         if len(url) > _MAX_CHECKOUT_URL or any(
@@ -487,6 +573,42 @@ def _safe_str(value: Any) -> str | None:
     return value
 
 
+def _snapshot(cart: Any) -> _CartSnapshot | None:
+    """Copy the cart's primitives before anything is awaited.
+
+    Returns None when the cart cannot be read at all, or when it holds more lines than
+    the adapter accepts. Reading the list once also bounds the work: a catalog that
+    appends to the caller's list cannot make the pricing loop run forever.
+    """
+    try:
+        items = list(getattr(cart, "items", None) or ())
+        if len(items) > _MAX_CART_ITEMS:
+            logger.warning("Refusing to create an order: too_many_items")
+            return None
+        lines = tuple(
+            _CartLine(
+                product_id=getattr(line, "product_id", None),
+                price=getattr(line, "price", None),
+                quantity=getattr(line, "quantity", None),
+            )
+            for line in items
+        )
+        return _CartSnapshot(lines=lines, currency=getattr(cart, "currency", None))
+    except Exception:  # pylint: disable=broad-exception-caught
+        # The cart is the caller's object; reading it must not raise out of the adapter.
+        logger.warning("Refusing to create an order: unreadable_cart")
+        return None
+
+
+def _valid_idempotency_key(value: Any) -> bool:
+    """Bounded by what the supported SDK accepts for the header, not by our own limit."""
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= _MAX_IDEMPOTENCY_KEY
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
 def _valid_identifier(value: Any) -> bool:
     """Accept an opaque host/API identifier only when it is bounded and printable."""
     return (
@@ -494,6 +616,20 @@ def _valid_identifier(value: Any) -> bool:
         and 1 <= len(value) <= _MAX_IDENTIFIER
         and not any(ord(character) < 32 or ord(character) == 127 for character in value)
     )
+
+
+def external_reference_for(idempotency_key: str) -> str:
+    """The ``external_reference`` this package sends for a given idempotency key.
+
+    Public so a host can index its own records by the same value and match an Order
+    webhook without the library storing anything. The algorithm is part of the contract:
+    ``"mpca-" + str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key))``.
+
+    A key generated internally — that is, calling ``checkout_handoff`` without one —
+    cannot be correlated later, because the caller never sees it. Pass your own key
+    whenever the Order must be reconcilable.
+    """
+    return _reference(idempotency_key)
 
 
 def _reference(idempotency_key: str) -> str:
@@ -542,14 +678,22 @@ def _amount(value: Decimal) -> str:
         return format(value.quantize(_AMOUNT_QUANTUM), "f")
 
 
-def _order_total(items: list[_PricedItem]) -> str:
-    """Sum line totals exactly within the bounded cart size."""
-    with localcontext() as context:
-        context.prec = 96
-        total = sum(
-            (item.unit_price * item.quantity for item in items), Decimal("0")
-        )
-        return _amount(total)
+def _order_total(items: list[_PricedItem]) -> str | None:
+    """Sum line totals exactly within the bounded cart size.
+
+    Returns None when the amount cannot be represented: a catalog price near the Decimal
+    limits can overflow once multiplied by a quantity, and that must fail closed like
+    every other refusal rather than raise out of the adapter.
+    """
+    try:
+        with localcontext() as context:
+            context.prec = 96
+            total = sum(
+                (item.unit_price * item.quantity for item in items), Decimal("0")
+            )
+            return _amount(total)
+    except (InvalidOperation, OverflowError, ValueError):
+        return None
 
 
 def _cause_codes(payload: Any) -> list[Any]:

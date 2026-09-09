@@ -50,10 +50,11 @@ Until then, install from a checkout of this repository:
 python -m pip install -e .
 ```
 
-The published package will depend only on the official
-[`mercadopago`](https://pypi.org/project/mercadopago/) SDK. Anthropic intentionally
-does not publish `shopping-agent-core`, so it is not a package dependency; install
-commerce-agents using Anthropic's own repository instructions.
+At runtime the package needs the official
+[`mercadopago`](https://pypi.org/project/mercadopago/) SDK, plus `requests` and security
+floors for its HTTP stack (`certifi`, `idna`, `urllib3`) — see `pyproject.toml`. What it
+deliberately does **not** depend on is anything from Anthropic: `shopping-agent-core` is
+intentionally unpublished, so install commerce-agents from Anthropic's own repository.
 
 ## Quick start
 
@@ -79,10 +80,9 @@ class MyBackend(StorefrontBackend):
 That is the whole integration. The public surface is two constructor arguments and one
 per-call option:
 
-```python
+```text
 MercadoPagoCheckout(*, sdk, catalog)
-
-await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
+checkout_handoff(session, cart, *, idempotency_key=None)
 ```
 
 - `sdk`: an already configured official Mercado Pago SDK instance. It owns credentials,
@@ -131,13 +131,27 @@ Webhook handling, persistence, Order reconciliation, fulfillment and payment con
 belong to your backend. This package creates one Order and returns one validated URL; it
 stores nothing and calls nothing back.
 
-The `external_reference` it sends is a UUIDv5 derived from the idempotency key
-(`mpca-<uuid5>`), so a host that keeps its own key can correlate a webhook without any
-callback from this library. It never contains the session id.
+The `external_reference` it sends is derived from the idempotency key, and the same
+value is available to you without storing anything here:
+
+```python
+from mercadopago_commerce_agents import external_reference_for
+
+reference = external_reference_for(my_key)   # "mpca-" + uuid5(NAMESPACE_URL, my_key)
+```
+
+Index your own record by that value and an Order webhook matches without any callback
+from this library. It never contains the session id. A key generated internally cannot be
+correlated later, because you never see it — pass your own whenever the Order has to be
+reconcilable.
 
 ## What happens during `checkout_handoff`
 
-1. Reject an empty cart or more than 20 lines.
+1. Reject an empty cart or more than 20 lines, and freeze the cart's lines,
+   quantities and currency before anything is awaited. Note that these caps are tighter
+   than commerce-agents' own defaults (`max_cart_lines=100`, `max_quantity_per_item=24`):
+   configure the upstream gates to 20/10 or a cart valid upstream will silently fall back
+   to your own checkout.
 2. Validate the idempotency key, or generate a UUID v4 when none was given.
 3. Resolve each product through the host's trusted catalog.
 4. Reject unknown lines unless stock is explicitly `True`, and validate price, currency,
@@ -220,7 +234,6 @@ it back through Orders API, and prints its hosted Checkout Pro URL:
 
 ```bash
 export MERCADOPAGO_TEST_ACCESS_TOKEN='seller-test-access-token'
-export MERCADOPAGO_TEST_BUYER_EMAIL='buyer@testuser.com'
 export MERCADOPAGO_TEST_CURRENCY='BRL'
 export MERCADOPAGO_LIVE_TEST_CONFIRM='create-order'
 .venv/bin/python examples/live_checkout.py

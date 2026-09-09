@@ -9,12 +9,14 @@ The commerce-agents types are faked here rather than imported, which is the poin
 repository installed. ``tests/test_contract.py`` covers the real thing.
 """
 
+import asyncio
 import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 from uuid import UUID
 
+import requests
 from mercadopago.config import RequestOptions
 
 from mercadopago_commerce_agents import CheckoutHandoff, MercadoPagoCheckout
@@ -90,6 +92,7 @@ class _Recorder:
                 "processing_mode": "manual",
                 "status": "created",
                 "currency": "BRL",
+                "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
                 "external_reference": body["external_reference"],
             }
@@ -168,6 +171,16 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             list(inspect.signature(MercadoPagoCheckout.checkout_handoff).parameters),
             ["self", "session", "cart", "idempotency_key"],
         )
+        # Names alone would stay green if the `*` markers were dropped, which would
+        # change the contract the README documents.
+        constructor = inspect.signature(MercadoPagoCheckout).parameters
+        for name in ("sdk", "catalog"):
+            self.assertEqual(constructor[name].kind, inspect.Parameter.KEYWORD_ONLY)
+        handoff = inspect.signature(MercadoPagoCheckout.checkout_handoff).parameters
+        for name in ("session", "cart"):
+            self.assertEqual(handoff[name].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        self.assertEqual(handoff["idempotency_key"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(handoff["idempotency_key"].default)
 
     async def test_refuses_unknown_product(self):
         recorder = _Recorder()
@@ -245,6 +258,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 "processing_mode": "manual",
                 "status": "created",
                 "currency": "ARS",
+                "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
                 "external_reference": body["external_reference"],
             }
@@ -312,14 +326,172 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
     # -- the remaining hardening --------------------------------------------------
 
-    # -- an order we refuse must not stay payable on the seller's account ----------
+    # -- the cart is the caller's object and stays mutable while we await ----------
 
-    async def test_cancels_an_order_it_refuses_to_hand_over(self):
-        """The order exists at Mercado Pago even when validation fails afterwards."""
+    async def test_freezes_the_cart_before_awaiting_the_catalog(self):
+        """A catalog that mutates the cart must not change what is charged."""
+        cart = _Cart(_Line("sku1", quantity=1))
+
+        class _Mutating:
+            def __init__(self):
+                self.calls = 0
+
+            async def get_product_details(self, _session, _product_id):
+                self.calls += 1
+                if self.calls == 1:
+                    cart.items.append(_Line("sku2"))
+                    cart.items[0].quantity = 10
+                    cart.currency = "USD"
+                return _Record()
+
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Mutating())
+
+        await checkout.checkout_handoff(_Session(), cart)
+
+        self.assertEqual(len(recorder.body["items"]), 1)
+        self.assertEqual(recorder.body["items"][0]["quantity"], 1)
+        self.assertEqual(recorder.body["total_amount"], "100.00")
+
+    async def test_a_catalog_that_grows_the_cart_cannot_loop_forever(self):
+        """Iterating the live list would never reach the size cap."""
+        cart = _Cart(_Line("sku1"))
+
+        class _Growing:
+            async def get_product_details(self, _session, _product_id):
+                cart.items.append(_Line(f"sku{len(cart.items) + 1}"))
+                return _Record()
+
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Growing())
+
+        await asyncio.wait_for(
+            checkout.checkout_handoff(_Session(), cart), timeout=5
+        )
+
+        self.assertEqual(len(recorder.body["items"]), 1)
+
+    async def test_refuses_the_same_product_on_several_lines(self):
+        """The caps are per line, so duplicates would multiply past them."""
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        handoffs = await checkout.checkout_handoff(
+            _Session(), _Cart(*[_Line("sku1", quantity=10) for _ in range(20)])
+        )
+
+        self.assertEqual(handoffs, [])
+        self.assertEqual(recorder.calls, [])
+
+    # -- idempotency on the wire ----------------------------------------------------
+
+    async def test_an_inherited_header_cannot_win_over_this_call_key(self):
+        """requests matches headers case-insensitively, so a stale spelling would."""
+        recorder = _Recorder()
+        checkout = self._checkout(
+            recorder,
+            catalog=_Catalog(sku1=_Record()),
+            request_options=RequestOptions(
+                access_token=TOKEN, custom_headers={"X-Idempotency-Key": "inherited"}
+            ),
+        )
+
+        await checkout.checkout_handoff(
+            _Session(), _Cart(_Line("sku1")), idempotency_key="this-call"
+        )
+
+        sent = recorder.headers
+        keys = [name for name in sent if name.lower() == "x-idempotency-key"]
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(sent[keys[0]], "this-call")
+
+    async def test_refuses_a_key_longer_than_the_sdk_accepts(self):
+        """mercadopago 3.5.0 caps the header at 64; building options would raise."""
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        handoffs = await checkout.checkout_handoff(
+            _Session(), _Cart(_Line("sku1")), idempotency_key="k" * 65
+        )
+
+        self.assertEqual(handoffs, [])
+        self.assertEqual(recorder.calls, [])
+
+    async def test_retries_once_with_the_same_key_after_a_transport_failure(self):
+        """A lost response does not prove the POST had no effect; Mercado Pago replays
+        an identical request rather than duplicating it."""
+        attempts = []
+
+        def create(body, request_options=None):
+            attempts.append((body, request_options.get_headers()["x-idempotency-key"]))
+            if len(attempts) == 1:
+                raise requests.ConnectionError("lost")
+            return {
+                "status": 201,
+                "response": {
+                    "id": "ORD-1",
+                    "checkout_url": CHECKOUT_URL,
+                    "type": "online",
+                    "processing_mode": "manual",
+                    "status": "created",
+                    "currency": "BRL",
+                    "expiration_time": "P1D",
+                    "total_amount": body["total_amount"],
+                    "external_reference": body["external_reference"],
+                },
+            }
+
+        sdk = mock.MagicMock()
+        sdk.request_options = RequestOptions(access_token=TOKEN)
+        sdk.order.return_value.create = create
+        checkout = MercadoPagoCheckout(sdk=sdk, catalog=_Catalog(sku1=_Record()))
+
+        handoffs = await checkout.checkout_handoff(
+            _Session(), _Cart(_Line("sku1")), idempotency_key="op-1"
+        )
+
+        self.assertEqual(len(handoffs), 1)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual({key for _, key in attempts}, {"op-1"})
+        self.assertEqual(attempts[0][0], attempts[1][0])
+
+    async def test_gives_up_after_two_transport_failures_naming_the_reference(self):
+        def create(body, request_options=None):
+            raise requests.ConnectionError("lost")
+
+        sdk = mock.MagicMock()
+        sdk.request_options = RequestOptions(access_token=TOKEN)
+        sdk.order.return_value.create = create
+        checkout = MercadoPagoCheckout(sdk=sdk, catalog=_Catalog(sku1=_Record()))
+
+        with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
+            handoffs = await checkout.checkout_handoff(
+                _Session(), _Cart(_Line("sku1")), idempotency_key="op-1"
+            )
+
+        self.assertEqual(handoffs, [])
+        reference = checkout_module._reference("op-1")
+        self.assertTrue(any(reference in line for line in logged.output))
+
+    # -- amounts and the response snapshot ------------------------------------------
+
+    async def test_refuses_an_amount_that_cannot_be_represented(self):
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record(price="1E+93")))
+
+        handoffs = await checkout.checkout_handoff(
+            _Session(), _Cart(_Line("sku1", price="1E+93", quantity=10))
+        )
+
+        self.assertEqual(handoffs, [])
+        self.assertEqual(recorder.calls, [])
+
+    async def test_refuses_an_order_that_came_back_without_the_expiry(self):
+        """The 24-hour window is what stops a stale link being paid at an old price."""
         recorder = _Recorder(
             response=lambda body: {
                 "id": "ORD-1",
-                "checkout_url": "https://evil.example.com/checkout",
+                "checkout_url": CHECKOUT_URL,
                 "type": "online",
                 "processing_mode": "manual",
                 "status": "created",
@@ -335,6 +507,55 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handoffs, [])
         sdk.order.return_value.cancel.assert_called_once_with("ORD-1")
+
+    # -- an order we refuse must not stay payable on the seller's account ----------
+
+    async def test_cancels_an_order_it_refuses_to_hand_over(self):
+        """The order exists at Mercado Pago even when validation fails afterwards."""
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "checkout_url": "https://evil.example.com/checkout",
+                "type": "online",
+                "processing_mode": "manual",
+                "status": "created",
+                "currency": "BRL",
+                "expiration_time": "P1D",
+                "total_amount": body["total_amount"],
+                "external_reference": body["external_reference"],
+            }
+        )
+        sdk = mock.MagicMock()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(handoffs, [])
+        sdk.order.return_value.cancel.assert_called_once_with("ORD-1")
+
+    async def test_reports_a_cancellation_the_api_rejects(self):
+        """A MagicMock returns a truthy object, not a 2xx — the success and failure
+        paths have to be told apart explicitly."""
+        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        sdk = mock.MagicMock()
+        sdk.order.return_value.cancel.return_value = {"status": 409, "response": {}}
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
+            await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertTrue(any("409" in line for line in logged.output))
+
+    async def test_logs_a_cancellation_the_api_accepts(self):
+        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        sdk = mock.MagicMock()
+        sdk.order.return_value.cancel.return_value = {"status": 200, "response": {}}
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        with self.assertLogs(checkout_module.logger, level="INFO") as logged:
+            await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertTrue(any("Cancelled refused order" in line for line in logged.output))
 
     async def test_does_not_cancel_an_order_it_hands_over(self):
         recorder = _Recorder()
@@ -605,9 +826,11 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
 
+        # Literal on purpose: comparing against the constant would let an accidental
+        # edit change production and test together.
         self.assertEqual(
             recorder.body["integration_data"],
-            {"platform_id": checkout_module._PLATFORM_ID},
+            {"platform_id": "dev_9e28fa65abb111f189e77e2ccf36aeec"},
         )
 
     async def test_never_sends_application_id_or_sponsor(self):
@@ -812,13 +1035,16 @@ class HandoffTypeTest(unittest.TestCase):
         )
         self.assertEqual(dumped, {"url": CHECKOUT_URL, "label": "Pay"})
 
-    def test_model_dump_tolerates_extra_pydantic_keywords(self):
-        handoff = CheckoutHandoff(url=CHECKOUT_URL)
+    def test_model_dump_rejects_options_it_does_not_implement(self):
+        """Swallowing them would let upstream change a handoff's meaning while this
+        contract test stayed green."""
+        handoff = CheckoutHandoff(url="https://example.com")
+
+        for option in ("exclude", "by_alias", "mode"):
+            with self.subTest(option=option):
+                with self.assertRaises(TypeError):
+                    handoff.model_dump(**{option: True})
+
         self.assertEqual(
-            handoff.model_dump(exclude_none=True, mode="json"),
-            {"url": CHECKOUT_URL},
+            handoff.model_dump(exclude_none=True), {"url": "https://example.com"}
         )
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -53,13 +53,17 @@ Expected evidence:
 1. The command prints exactly one order ID beginning with the Orders identifier used by
    the API.
 2. `sdk.order().get(order_id)` returns HTTP 200 and the same ID.
-3. The URL uses HTTPS and a Mercado Pago hostname.
-4. Opening the URL displays the Mercado Pago hosted Checkout Pro page and the expected
+3. Opening the URL displays the Mercado Pago hosted Checkout Pro page and the expected
    item/amount.
-5. Retrying the same durable checkout attempt uses the same idempotency key; a new
-   checkout flow uses another attempt ID and key.
-6. The persisted snapshot contains the same Order ID, currency, amount, and reference
-   returned by Mercado Pago.
+4. The order carries `integration_data.platform_id`.
+5. The URL uses HTTPS and a Mercado Pago hostname.
+
+The script does **not** cover these; verify them in a host that persists state, or as
+separate manual steps:
+
+- replaying the same `idempotency_key` with the same cart and confirming Mercado Pago
+  returns the same Order rather than a second one;
+- persisting the Order snapshot and matching it to `external_reference_for(key)`.
 
 With Orders API, this validation creates an **order** and returns `checkout_url`. A
 preference and `init_point` belong to the legacy Preferences API and are not expected.

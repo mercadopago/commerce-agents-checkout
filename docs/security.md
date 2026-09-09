@@ -8,7 +8,11 @@ confirm payment.
 
 - Catalog title is authoritative; a cart/catalog price mismatch requires a new shopper
   confirmation instead of silently charging the new value.
-- Cart, catalog, configured seller, and returned Order currencies must agree.
+- The cart's lines, quantities and currency are frozen before the first `await`, so a
+  catalog that mutates the caller's cart cannot change what is charged.
+- Cart, catalog and returned Order currencies must agree; there is no separate seller
+  currency setting to get wrong.
+- The same product on several lines is refused, so the per-line caps cannot be multiplied.
 - Stock fails closed and is accepted only when the catalog returns boolean `True`.
 - Cart line count, quantity, and caller-controlled identifier lengths are bounded.
 - Prices must be finite, positive, and have at most two decimals.

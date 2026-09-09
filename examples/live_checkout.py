@@ -72,6 +72,15 @@ class _RecordingOrder:  # pylint: disable=too-few-public-methods
             self.created = response
         return result
 
+    def cancel(self, order_id, request_options=None):
+        """Delegate to the real resource. Without this the adapter's cleanup after a
+        refused order silently fails and leaves that order payable."""
+        return self._resource.cancel(order_id, request_options)
+
+    def get(self, order_id, request_options=None):
+        """Delegate the read-back used by this validation."""
+        return self._resource.get(order_id, request_options)
+
 
 class _RecordingSDK:  # pylint: disable=too-few-public-methods
     """Expose the SDK surface used by the adapter and capture its Order resource."""

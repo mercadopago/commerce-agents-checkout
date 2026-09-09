@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -52,8 +52,36 @@ jobs:
       - name: Lint with Pylint
         run: pylint --max-line-length=100 src/mercadopago_commerce_agents examples
 
+      - name: Audit dependencies
+        run: |
+          pip install "pip-audit==2.9.0"
+          pip-audit --strict --desc
+
       - name: Lint with Isort
         run: isort --check-only --diff src tests examples
+
+  minimum-dependencies:
+    # `pip install -e .` resolves the newest SDK, so the declared floor is never
+    # exercised. RequestOptions and the Order resource differ across versions, and the
+    # unit tests mock them — this job runs the real boundary at the floor.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Install at the declared floor
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          pip install -e .
+          pip install "mercadopago==3.5.0"
+          pip check
+
+      - name: Test
+        run: python -m unittest discover -s tests
 
   contract:
     # Blocking. Proves this release works with the pinned commerce-agents commit.

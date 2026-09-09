@@ -19,7 +19,7 @@ acceptable channel: use **Security → Report a vulnerability**.
 
 Please include:
 
-- the affected version (`pip show mercadopago-commerce-agents`);
+- the affected version (`pip show mercadopago-commerce-agents-checkout`);
 - a minimal reproduction, ideally as a failing test against the mocked SDK;
 - the impact you believe it has on the charged amount, the created order, or the data
   reaching Mercado Pago or the logs.

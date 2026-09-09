@@ -3,7 +3,7 @@ requires = ["setuptools == 80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mercadopago-commerce-agents"
+name = "mercadopago-commerce-agents-checkout"
 version = "0.1.0"
 authors = [{ name = "Mercado Pago", email = "mp_sdk@mercadopago.com" }]
 description = "Mercado Pago Checkout Pro via Orders API for commerce-agents"

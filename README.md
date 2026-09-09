@@ -14,9 +14,11 @@ cart, and the backend adds the hosted checkout URL *after* the model's tool call
 package implements that backend handoff with a server-side Mercado Pago order and
 returns the validated `checkout_url` to the host.
 
-This version uses `POST /v1/orders` with `processing_mode=manual`. It does **not** create
-a Checkout Pro preference or call `POST /checkout/preferences`; the Orders API returns
-the hosted Checkout Pro URL directly.
+This version uses `POST /v1/orders` with `processing_mode=manual`. It never calls
+`POST /checkout/preferences`, and the resource it creates — the one to look up, cancel or
+reconcile — is the **order**. Mercado Pago still mints a preference behind it, visible as
+the `pref_id` inside the returned `checkout_url`, but that is an implementation detail of
+the hosted page.
 
 ## Requirements
 
@@ -31,13 +33,15 @@ the hosted Checkout Pro URL directly.
 After the first PyPI release:
 
 ```bash
-pip install mercadopago-commerce-agents
+pip install mercadopago-commerce-agents-checkout
 ```
 
-The distribution and the import package share the same name:
+The distribution name and the import name differ on purpose — the distribution is
+scoped to this checkout adapter, while the import package is the one commerce-agents
+hosts already reference:
 
 ```python
-from mercadopago_commerce_agents import MercadoPagoCheckout
+from mercadopago_commerce_agents import MercadoPagoCheckout  # not ..._checkout
 ```
 
 Until then, install from a checkout of this repository:

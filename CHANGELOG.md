@@ -57,6 +57,12 @@ await checkout.checkout_handoff(session, cart, *, idempotency_key=None)
 
 ### Fixed
 
+- The distribution is published as `mercadopago-commerce-agents-checkout`, which differs
+  from the `mercadopago_commerce_agents` import package on purpose.
+- Corrected the claim that this flow creates no preference. It calls Orders, not the
+  Preferences API, but Mercado Pago mints a preference behind the order and exposes it as
+  `pref_id` inside `checkout_url`.
+
 - Cancel an order that fails post-creation validation. The order exists at Mercado Pago by
   the time the response is checked, so refusing the handoff used to strand a payable order
   on the seller's account for the full expiry window — including the case where the catalog

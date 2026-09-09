@@ -1,15 +1,15 @@
 # Releasing to PyPI
 
-The distribution name matches the import package:
+The distribution name and the import package differ:
 
 ```text
-mercadopago-commerce-agents        # pip install
-mercadopago_commerce_agents        # import
+mercadopago-commerce-agents-checkout   # pip install
+mercadopago_commerce_agents            # import
 ```
 
-Claiming the adjacent `mercadopago-commerce-agents-checkout` defensively is worth doing
-at the same time: it is the name the predecessor repository advertised, and leaving it
-unregistered is a dependency-confusion opening.
+Claim the adjacent `mercadopago-commerce-agents` defensively at the same time: it matches
+the import name, so it is what someone will guess, and leaving it unregistered is a
+dependency-confusion opening.
 
 ## Release gates
 

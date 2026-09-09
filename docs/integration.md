@@ -118,8 +118,10 @@ hand, and the handoff still falls back. An order whose id could not even be read
 cancelled — that case is logged too.
 
 The order ID is the authoritative resource identifier for status lookup, cancellation,
-refunds, and Order webhooks. The Orders API flow does not create or return a preference
-or `init_point`. Production hosts should persist their idempotency key before calling,
+refunds, and Order webhooks. This flow never calls the Preferences API and never receives
+an `init_point`; Mercado Pago still mints a preference behind the order, which surfaces as
+the `pref_id` query parameter inside `checkout_url`, but that value is an implementation
+detail of the hosted page — do not build on it. Production hosts should persist their idempotency key before calling,
 which is what later ties a webhook back to the operation.
 
 ## Failure behavior

@@ -685,6 +685,9 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_an_order_that_does_not_match_the_confirmed_snapshot(self):
         def response_with(**overrides):
             def response(body):
+                # The expiry belongs in the baseline: without it every subcase below
+                # would be refused for the missing expiry before reaching the field it
+                # means to test, and those checks could regress while staying green.
                 payload = {
                     "id": "ORD-1",
                     "checkout_url": CHECKOUT_URL,
@@ -692,6 +695,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     "processing_mode": "manual",
                     "status": "created",
                     "currency": "BRL",
+                    "expiration_time": "P1D",
                     "total_amount": body["total_amount"],
                     "external_reference": body["external_reference"],
                 }

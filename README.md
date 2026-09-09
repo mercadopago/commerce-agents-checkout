@@ -100,8 +100,12 @@ including what to do with the webhook afterwards, see
 ```bash
 python examples/seller_integration.py            # print the wiring and exit
 python examples/seller_integration.py --create   # create one order against a test seller
-``` The public surface is two constructor arguments and one
-per-call option:
+```
+
+Run those from a clone or the sdist — `examples/` ships in the source archive, not in the
+wheel.
+
+The public surface is two constructor arguments and one per-call option:
 
 ```text
 MercadoPagoCheckout(*, sdk, catalog)

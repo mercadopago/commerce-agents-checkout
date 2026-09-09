@@ -71,6 +71,7 @@ Security reports should review the consuming host as well as this library; revie
 adapter alone cannot establish authentication, authorization, or payment correctness.
 
 The package keeps its dependency surface small on purpose: the official Mercado Pago SDK
-for transport, the standard library for everything else, and no runtime Pydantic. Its
-external boundary is validated explicitly with bounded inputs and exercised by the
-hostile-input tests.
+for transport, `requests` for the exception types raised by it, and security floors for
+that HTTP stack (`certifi`, `idna`, `urllib3`) — the full list is in `pyproject.toml`.
+There is no runtime Pydantic. Its external boundary is validated explicitly with bounded
+inputs and exercised by the hostile-input tests.

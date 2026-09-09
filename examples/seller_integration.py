@@ -21,6 +21,7 @@ imports them — it reads the same attributes off whatever the host passes.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -92,58 +93,97 @@ class Session:
 
 class SellerBackend:
     """In a real deployment this subclasses commerce-agents' ``StorefrontBackend`` and
-    already implements ``get_product_details``; wiring the checkout adds one method."""
+    already implements ``get_product_details``; wiring the checkout adds one method.
+
+    ``checkout_handoff`` takes exactly the two arguments commerce-agents calls it with —
+    `enrichment.py` does ``await backend.checkout_handoff(context.session, cart)`` — so
+    the idempotency key has to be obtained *here*, not passed in from outside. Holding it
+    yourself is also what makes reconciliation possible: a key the adapter generates
+    internally is never handed back.
+    """
 
     def __init__(self, sdk: mercadopago.SDK) -> None:
         self.catalog = SellerCatalog()
         self.mercadopago = MercadoPagoCheckout(sdk=sdk, catalog=self.catalog)
+        # A dict is enough to read; a real deployment needs a durable table, because a
+        # retry may cross a process restart and must find the same key.
+        self._attempts: dict[str, tuple[str, str]] = {}
 
     async def get_product_details(self, session: object, product_id: str) -> Product | None:
         """Delegate to the catalog, as a StorefrontBackend already does."""
         return await self.catalog.get_product_details(session, product_id)
 
-    async def checkout_handoff(self, session: Session, cart: Cart, *, idempotency_key: str):
-        """What commerce-agents calls after the model's `checkout` tool call.
-
-        Pass your own idempotency key: one per intentional purchase, reused only when
-        retrying that same purchase. Keep it — it is what ties the webhook back.
-        """
+    async def checkout_handoff(self, session: Session, cart: Cart):
+        """Exactly the signature commerce-agents calls."""
+        key = await self.checkout_key(session, cart)
         return await self.mercadopago.checkout_handoff(
-            session, cart, idempotency_key=idempotency_key
+            session, cart, idempotency_key=key
         )
+
+    async def checkout_key(self, session: Session, cart: Cart) -> str:
+        """One key per confirmed cart, reused only while that cart is unchanged.
+
+        Retrying the same confirmed cart must reuse it, or Mercado Pago creates a second
+        payable order. Any change to the cart is a different purchase and needs a new one.
+        Store it before returning: `external_reference_for(key)` is what a webhook will
+        match against later.
+        """
+        fingerprint = json.dumps(
+            sorted((line.product_id, line.quantity, line.price) for line in cart.items),
+            separators=(",", ":"),
+        )
+        stored = self._attempts.get(session.session_id)
+        if stored is not None and stored[0] == fingerprint:
+            return stored[1]
+        key = f"order-{uuid4()}"
+        self._attempts[session.session_id] = (fingerprint, key)
+        return key
 
 
 # --- afterwards: the part this package deliberately leaves to you ------------------
 
-async def handle_order_webhook(order_id: str, stored_key: str, sdk: mercadopago.SDK) -> bool:
-    """Sketch of the reconciliation the host owns. Not called by the example.
+async def compare_order_with_your_record(
+    order_id: str, stored_key: str, expected_amount: str, expected_currency: str,
+    sdk: mercadopago.SDK,
+) -> dict | None:
+    """**Incomplete on purpose — one step of a webhook handler, not the handler.**
 
-    A handoff means an order exists, never that it was paid. Validate the webhook's
-    `x-signature` first (see the README), then fetch the order and compare it with what
-    you stored. `external_reference_for` gives you the reference without this package
-    storing anything for you.
+    This does the single part that belongs to this package's contract: fetch the order
+    and check it against what you stored. It returns the order, or None when it does not
+    match. It deliberately does not return a boolean, because a boolean here reads like
+    "safe to fulfil" and this is not enough to authorise fulfilment.
+
+    You must implement, around it:
+
+    1. **Validate the `x-signature` header before calling this.** An unverified
+       notification is attacker-controlled input. See the Webhooks guide linked in the
+       README; the official SDK exposes ``mercadopago.webhook.WebhookSignatureValidator``.
+    2. **Deduplicate by the notification id.** Mercado Pago retries, and a handler that
+       is not idempotent will fulfil twice.
+    3. **Decide which order status your flow treats as paid**, and apply a valid local
+       state transition from whatever state you are in — never a blind overwrite.
+
+    Never treat a browser redirect or a query parameter as payment evidence.
     """
     result = await asyncio.to_thread(sdk.order().get, order_id)
+    if result.get("status") != 200:
+        return None
     order = result.get("response") or {}
-    return (
-        result.get("status") == 200
-        and order.get("external_reference") == external_reference_for(stored_key)
-        and order.get("status") == "processed"  # whatever your flow treats as paid
+    matches = (
+        order.get("external_reference") == external_reference_for(stored_key)
+        and order.get("total_amount") == expected_amount
+        and order.get("currency") == expected_currency
     )
+    return order if matches else None
 
 
 async def main() -> None:
     """Create one order for a two-line cart and print what the host would keep."""
     cart = Cart(items=[CartLine("tshirt-m", "49.90", 1), CartLine("mug", "29.90", 2)])
-    # One key per intentional purchase. Persist it before calling: it is the only thing
-    # that ties this checkout to the webhook that arrives later.
-    idempotency_key = f"order-{uuid4()}"
-
-    print("Cart:", [(line.product_id, line.quantity) for line in cart.items])
-    print("Idempotency key:", idempotency_key)
-    print("External reference to store:", external_reference_for(idempotency_key))
+    session = Session(session_id="session-from-your-host")
 
     if "--create" not in sys.argv:
+        print("Cart:", [(line.product_id, line.quantity) for line in cart.items])
         print("\nNo order created. Re-run with --create and MERCADOPAGO_ACCESS_TOKEN set.")
         return
 
@@ -152,9 +192,15 @@ async def main() -> None:
         raise SystemExit("MERCADOPAGO_ACCESS_TOKEN is required with --create")
 
     backend = SellerBackend(mercadopago.SDK(token))
-    handoffs = await backend.checkout_handoff(
-        Session(session_id="session-from-your-host"), cart, idempotency_key=idempotency_key
-    )
+
+    # commerce-agents calls the two-argument form; the key lives inside the backend.
+    # Reading it here is what a host does to persist it alongside its own order record.
+    key = await backend.checkout_key(session, cart)
+    print("Cart:", [(line.product_id, line.quantity) for line in cart.items])
+    print("Idempotency key to store:", key)
+    print("External reference to match a webhook against:", external_reference_for(key))
+
+    handoffs = await backend.checkout_handoff(session, cart)
 
     if not handoffs:
         print("\nNo handoff. The adapter refused; your own checkout takes over.")

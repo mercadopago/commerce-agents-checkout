@@ -101,9 +101,29 @@ jobs:
           git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
 
       - name: Build and validate distributions
+        env:
+          # Constrain the isolated build environment so the artifact does not depend on
+          # whatever setuptools happens to be newest that day, and stays above the fixed
+          # release of GHSA-h35f-9h28-mq5c.
+          PIP_CONSTRAINT: build-constraints.txt
         run: |
+          printf 'setuptools>=83.0.0,<85\nwheel>=0.45,<1\n' > build-constraints.txt
           python -m build
           python -m twine check dist/*
+          rm build-constraints.txt
+
+      - name: Audit what the artifact actually resolves
+        run: |
+          set -euo pipefail
+          # The CI job audits a development environment; this audits the environment a
+          # user gets from this wheel, which is the one that ships.
+          python -m venv /tmp/artifact-check
+          /tmp/artifact-check/bin/pip install --upgrade pip==26.2.1
+          /tmp/artifact-check/bin/pip install dist/*.whl
+          /tmp/artifact-check/bin/pip install "pip-audit==2.9.0"
+          /tmp/artifact-check/bin/pip-audit --strict --desc
+          # And prove the published package imports with nothing else present.
+          /tmp/artifact-check/bin/python -c "import mercadopago_commerce_agents as m; print(m.__all__)"
 
       - name: Store distributions
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

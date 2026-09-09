@@ -1,24 +1,37 @@
 # Mercado Pago Checkout Pro for commerce-agents
 
-Mercado Pago Checkout Pro via Orders API as a `checkout_handoff` provider for
-[anthropics/commerce-agents](https://github.com/anthropics/commerce-agents).
+[Anthropic's commerce-agents](https://github.com/anthropics/commerce-agents) is a shopping
+agent built on Claude: a customer talks to it, it searches your catalog and fills a cart.
+It deliberately stops short of taking money — its `checkout` tool, in Anthropic's words,
+"renders the cart for the host to complete".
 
-> **Pre-release repository.** The package has not been published to PyPI. The Orders API
-> flow has been exercised end to end against the real API — an order is created, read
-> back, and its hosted Checkout Pro URL opens — but completing a payment on that hosted
-> page and the WebSec review below are still open. Use dedicated test users until both
-> are done.
+**This package completes it with Mercado Pago.** Wire it into the backend you already
+implement for the agent, and the conversation ends with a real Checkout Pro payment link:
 
-The shopping agent deliberately stops before payment. Its `checkout` tool renders the
-cart, and the backend adds the hosted checkout URL *after* the model's tool call. This
-package implements that backend handoff with a server-side Mercado Pago order and
-returns the validated `checkout_url` to the host.
+```python
+class MyBackend(StorefrontBackend):
+    def __init__(self):
+        self.mercadopago = MercadoPagoCheckout(sdk=mercadopago.SDK(token), catalog=self)
 
-This version uses `POST /v1/orders` with `processing_mode=manual`. It never calls
-`POST /checkout/preferences`, and the resource it creates — the one to look up, cancel or
-reconcile — is the **order**. Mercado Pago still mints a preference behind it, visible as
-the `pref_id` inside the returned `checkout_url`, but that is an implementation detail of
-the hosted page.
+    async def checkout_handoff(self, session, cart):
+        return await self.mercadopago.checkout_handoff(session, cart)
+```
+
+That is the whole integration: two arguments and one method. What you get for it:
+
+- **The model never decides the price.** Every line is re-read from your own catalog
+  before the order is created — the cart is filled by an LLM's tool calls, so its prices
+  are treated as a claim to verify, not a fact. A cart edited to `0.01` does not become a
+  payable link.
+- **The model never sees the payment URL.** commerce-agents fills it in after the tool
+  call, and this package hands it back validated against Mercado Pago's own hosts.
+- **Nothing to run or store.** No webhook server, no database, no background job inside
+  this library — it creates one order and returns one URL.
+
+> **Pre-release repository.** Not yet published to PyPI. The Orders API flow has been
+> exercised end to end against the real API — an order is created, read back, and its
+> hosted Checkout Pro URL opens — but completing a payment on that hosted page and the
+> WebSec review are still open. Use dedicated test users until both are done.
 
 ## Requirements
 
@@ -56,7 +69,9 @@ floors for its HTTP stack (`certifi`, `idna`, `urllib3`) — see `pyproject.toml
 deliberately does **not** depend on is anything from Anthropic: `shopping-agent-core` is
 intentionally unpublished, so install commerce-agents from Anthropic's own repository.
 
-## Quick start
+## The API
+
+The snippet at the top with its imports, and where the token comes from:
 
 ```python
 import os
@@ -77,7 +92,8 @@ class MyBackend(StorefrontBackend):
         return await self.mercadopago.checkout_handoff(session, cart)
 ```
 
-That is the whole integration. The public surface is two constructor arguments and one
+`MyBackend` is the `StorefrontBackend` commerce-agents already requires you to write —
+this adds one method to it. The public surface is two constructor arguments and one
 per-call option:
 
 ```text
@@ -144,6 +160,14 @@ Index your own record by that value and an Order webhook matches without any cal
 from this library. It never contains the session id. A key generated internally cannot be
 correlated later, because you never see it — pass your own whenever the Order has to be
 reconcilable.
+
+## How it talks to Mercado Pago
+
+This version uses `POST /v1/orders` with `processing_mode=manual`. It never calls
+`POST /checkout/preferences`, and the resource it creates — the one to look up, cancel or
+reconcile — is the **order**. Mercado Pago still mints a preference behind it, visible as
+the `pref_id` inside the returned `checkout_url`, but that is an implementation detail of
+the hosted page.
 
 ## What happens during `checkout_handoff`
 

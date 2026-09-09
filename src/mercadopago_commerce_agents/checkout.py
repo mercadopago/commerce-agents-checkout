@@ -82,6 +82,10 @@ _MAX_IDENTIFIER = 256
 # which would raise out of the adapter instead of failing closed.
 _MAX_IDEMPOTENCY_KEY = 64
 _IDEMPOTENCY_HEADER = "x-idempotency-key"
+# What a catalog record has to expose. Checked as a group so that a record which is not
+# a record at all — a dict is the usual slip — says so, instead of being reported as
+# whichever attribute happened to be read first.
+_CATALOG_FIELDS = ("title", "price", "currency", "in_stock")
 _MAX_CHECKOUT_URL = 2048
 _MAX_DECIMAL_TEXT = 64
 _AMOUNT_QUANTUM = Decimal("0.01")
@@ -327,7 +331,11 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             record = await self._catalog.get_product_details(session, product_id)
             if record is None:
                 raise _Refused("product_not_found")
-            if getattr(record, "in_stock", None) is not True:
+            if any(not hasattr(record, field) for field in _CATALOG_FIELDS):
+                # Reporting this as `out_of_stock` sent integrators looking through their
+                # inventory for a record that was simply the wrong shape.
+                raise _Refused("invalid_catalog_record")
+            if record.in_stock is not True:
                 raise _Refused("out_of_stock")
 
             record_currency = getattr(record, "currency", None)
@@ -378,6 +386,10 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
 
         if currency is None:  # unreachable: an empty snapshot returns before this
             raise _Refused("invalid_currency")
+        if snapshot.currency is None:
+            # Distinct from a mismatch: nothing was set, so "they disagree" would send
+            # the integrator comparing two values when one does not exist.
+            raise _Refused("missing_cart_currency")
         if snapshot.currency != currency:
             raise _Refused("currency_mismatch")
         return items, currency

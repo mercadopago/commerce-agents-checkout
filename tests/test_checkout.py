@@ -221,6 +221,35 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(handoffs, [])
                 self.assertEqual(recorder.calls, [])
 
+    async def test_a_record_of_the_wrong_shape_says_so(self):
+        """Returning a dict is the usual slip; reporting it as out of stock sent people
+        looking through their inventory."""
+        recorder = _Recorder()
+
+        class _DictCatalog:
+            async def get_product_details(self, _session, _product_id):
+                return {"title": "T", "price": "10.00", "currency": "BRL", "in_stock": True}
+
+        checkout = self._checkout(recorder, catalog=_DictCatalog())
+
+        with self.assertLogs(checkout_module.logger, level="WARNING") as logged:
+            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(handoffs, [])
+        self.assertEqual(recorder.calls, [])
+        self.assertTrue(any("invalid_catalog_record" in line for line in logged.output))
+
+    async def test_a_cart_without_a_currency_says_so(self):
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+        cart = SimpleNamespace(items=[_Line("sku1")])  # no `currency` at all
+
+        with self.assertLogs(checkout_module.logger, level="WARNING") as logged:
+            handoffs = await checkout.checkout_handoff(_Session(), cart)
+
+        self.assertEqual(handoffs, [])
+        self.assertTrue(any("missing_cart_currency" in line for line in logged.output))
+
     async def test_prices_every_line_from_the_catalog(self):
         recorder = _Recorder()
         catalog = _Catalog(sku1=_Record(price=10.0), sku2=_Record(price=20.5))

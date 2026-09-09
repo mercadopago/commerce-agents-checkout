@@ -133,7 +133,8 @@ The method returns `[]` without creating an order when:
 - a product identifier or a supplied idempotency key is empty, contains control
   characters, or is longer than 256 characters;
 - a quantity is not an integer between 1 and 10;
-- the catalog does not know a product or does not report `in_stock is True`;
+- the catalog does not know a product, returns a record missing any of `title`,
+  `price`, `currency` or `in_stock`, or does not report `in_stock is True`;
 - a catalog price is non-positive, non-finite, or has more than two decimals;
 - the catalog records disagree on currency, or the cart disagrees with them;
 - the cart price differs from the catalog price and needs shopper reconfirmation;
@@ -159,7 +160,7 @@ minor version bump and a changelog entry:
   `too_many_items`, `invalid_product_id`, `product_not_found`, `out_of_stock`,
   `invalid_price`, `invalid_currency`, `invalid_quantity`, `cart_reconfirmation_required`,
   `invalid_title`, `duplicate_product`, `amount_out_of_range`, `unreadable_cart`,
-  and `invalid_idempotency_key`.
+  `invalid_catalog_record`, `missing_cart_currency`, and `invalid_idempotency_key`.
 
 A local refusal is logged at `WARNING` as `Refusing to create an order: <code>`; a
 Mercado Pago rejection or an infrastructure failure is logged at `ERROR`. Attach a

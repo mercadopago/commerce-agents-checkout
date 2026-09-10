@@ -33,11 +33,16 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
   match an Order webhook without this package storing anything.
 - Retries once with the same key after a transport failure, because a lost response does
   not prove the request had no effect.
+- Raises `CheckoutOutcomeUnknown` instead of returning the host fallback when create or
+  cleanup may have taken effect but cannot be proven. The exception carries the key and
+  opaque reference required for controlled recovery.
+- Canonicalizes item order by product ID, so a reordered retry keeps the same Orders body.
 - Validates the created order — type, processing mode, status, reference, amount,
   currency, expiry and the checkout host — and cancels the order when that check fails,
-  rather than leaving it payable.
-- Returns `[]` and logs a bounded reason code on every refusal, so an outage degrades
-  checkout instead of breaking the turn.
+  using a separate deterministic idempotency key. Fallback is allowed only after cleanup
+  is confirmed for the same Order in `canceled` state.
+- Returns `[]` and logs a bounded reason code on definitive refusals. Indeterminate
+  remote outcomes stop fallback until the host reconciles them.
 
 ### What it deliberately leaves to the host
 

@@ -4,8 +4,8 @@
 
 The default suite has no network access. It replaces `sdk.order().create` and verifies
 the body, attempt-scoped idempotency header, price/currency/stock confirmation, bounded
-quantity conversion, Order snapshot persistence, URL allowlist, failure paths, and log
-redaction.
+quantity conversion, validation of the returned Order snapshot, URL allowlist, failure
+paths, indeterminate outcomes, cancellation cleanup, and log redaction.
 
 ```bash
 python3.12 -m venv .venv
@@ -54,6 +54,16 @@ export MERCADOPAGO_LIVE_TEST_CONFIRM='create-order'
 .venv/bin/python examples/live_checkout.py
 ```
 
+That mode repeats the create call with the same key and confirms that Mercado Pago returns
+the original Order. A separate opt-in mode creates one Order, makes the response presented
+to the adapter fail post-create validation, and verifies the real cancellation by reading
+the Order back in `canceled` state:
+
+```bash
+export MERCADOPAGO_LIVE_TEST_CONFIRM='verify-cancellation'
+.venv/bin/python examples/live_checkout.py
+```
+
 Expected evidence:
 
 1. The command prints exactly one order ID beginning with the Orders identifier used by
@@ -63,12 +73,14 @@ Expected evidence:
    item/amount.
 4. The order carries `integration_data.platform_id`.
 5. The URL uses HTTPS and a Mercado Pago hostname.
+6. Replaying the same key returns the same Order ID and URL.
+
+For `verify-cancellation`, the evidence is the created Order ID plus a GET observing
+`status=canceled`; the script must not print or return its checkout URL.
 
 The script does **not** cover these; verify them in a host that persists state, or as
 separate manual steps:
 
-- replaying the same `idempotency_key` with the same cart and confirming Mercado Pago
-  returns the same Order rather than a second one;
 - persisting the Order snapshot and matching it to `external_reference_for(key)`.
 
 With Orders API, this validation creates an **order** and returns `checkout_url`. A

@@ -16,6 +16,7 @@ the model call has completed.
 ```text
 MercadoPagoCheckout(*, sdk: mercadopago.SDK, catalog: Catalog)
 checkout_handoff(session, cart, *, idempotency_key: str | None = None)
+CheckoutOutcomeUnknown(idempotency_key, external_reference, reason)
 ```
 
 - `sdk` must already contain a backend Access Token.
@@ -27,6 +28,8 @@ checkout_handoff(session, cart, *, idempotency_key: str | None = None)
   internal retries. Supplied, it is validated and used verbatim; an invalid value fails
   closed instead of being replaced. Reusing a key with a different payload is answered by
   Mercado Pago with `HTTP 409 idempotency_key_already_used`.
+- A supplied key is limited to 64 characters by the supported SDK. Product and Order
+  identifiers have their own 256-character validation boundary.
 
 The adapter does not own authentication, secrets management, persistence, reconciliation
 or webhook delivery, and exposes no callbacks for them. A host correlates a webhook through
@@ -113,10 +116,12 @@ The accepted URL becomes:
 ```
 
 When that validation fails the order has already been created, so the adapter cancels it
-through `sdk.order().cancel(order_id)` before returning `[]`. Cancellation is best effort:
-if it does not land, the order id is logged at `ERROR` so the seller can reconcile by
-hand, and the handoff still falls back. An order whose id could not even be read cannot be
-cancelled — that case is logged too.
+through `sdk.order().cancel(order_id, request_options)` with a separate deterministic
+idempotency key. It returns `[]` only after Mercado Pago confirms the cancellation. If the
+response does not identify that same Order in `canceled` state, cleanup fails, is
+interrupted, or the order ID cannot be read, it raises
+`CheckoutOutcomeUnknown` so the host cannot silently expose its fallback while an Order
+may remain payable.
 
 The order ID is the authoritative resource identifier for status lookup, cancellation,
 refunds, and Order webhooks. This flow never calls the Preferences API and never receives
@@ -130,8 +135,10 @@ which is what later ties a webhook back to the operation.
 The method returns `[]` without creating an order when:
 
 - the cart is empty or contains more than 20 lines;
-- a product identifier or a supplied idempotency key is empty, contains control
-  characters, or is longer than 256 characters;
+- a product identifier is empty, contains control characters, or is longer than 256
+  characters;
+- a supplied idempotency key is empty, contains control characters, or is longer than 64
+  characters;
 - a quantity is not an integer between 1 and 10;
 - the catalog does not know a product, returns a record missing any of `title`,
   `price`, `currency` or `in_stock`, or does not report `in_stock is True`;
@@ -140,20 +147,28 @@ The method returns `[]` without creating an order when:
 - the cart price differs from the catalog price and needs shopper reconfirmation;
 - the same product appears on more than one line;
 - the order total cannot be represented as a two-decimal amount;
-- Mercado Pago rejects the request, or stays unreachable across two attempts with the
-  same key;
+- Mercado Pago definitively rejects the request with a non-ambiguous client error;
 - the response does not match the confirmed snapshot or contain a valid Order ID and
-  Mercado Pago `checkout_url`.
+  Mercado Pago `checkout_url`, and cancellation is confirmed.
+
+The method raises `CheckoutOutcomeUnknown` instead of returning `[]` when a create or
+cleanup POST may have taken effect but cannot be proven. This includes cancellation of the
+Python coroutine while its worker thread is still running, two transport failures, an
+ambiguous HTTP/SDK response, `HTTP 409`, an unreadable created Order ID, and cleanup that
+is not confirmed. The exception exposes `idempotency_key`, `external_reference`, and a
+bounded `reason`; its message never contains the key. Stop the fallback, reconcile the
+reference and reuse that exact key if a retry is appropriate.
 
 Logs contain reason codes and Mercado Pago error codes only. They omit tokens, session
 IDs, prices, product identifiers, payloads, response bodies, and checkout URLs.
 
 ### Observing refusals
 
-There is no refusal callback: the adapter returns `[]` and the host cannot tell the
-reasons apart from the return value alone. Observability therefore goes through logging,
-and these two things are treated as a public contract that will not change without a
-minor version bump and a changelog entry:
+There is no callback for definitive refusals: the adapter returns `[]` and the host cannot
+tell those reasons apart from the return value alone. Indeterminate outcomes are distinct
+exceptions. Observability for refusals therefore goes through logging, and these two
+things are treated as a public contract that will not change without a minor version bump
+and a changelog entry:
 
 - the logger name `mercadopago_commerce_agents.checkout`;
 - the reason codes themselves — `currency_mismatch`,

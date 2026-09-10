@@ -17,7 +17,8 @@ class MyBackend(StorefrontBackend):
         return await self.mercadopago.checkout_handoff(session, cart)
 ```
 
-That is the whole integration: two arguments and one method. What you get for it:
+That is the minimal adapter wiring: two arguments and one method. A production backend
+also owns the checkout-attempt lifecycle described below. What you get from the package:
 
 - **The model never decides the price.** Every line is re-read from your own catalog
   before the order is created — the cart is filled by an LLM's tool calls, so its prices
@@ -25,8 +26,9 @@ That is the whole integration: two arguments and one method. What you get for it
   payable link.
 - **The model never sees the payment URL.** commerce-agents fills it in after the tool
   call, and this package hands it back validated against Mercado Pago's own hosts.
-- **Nothing to run or store.** No webhook server, no database, no background job inside
-  this library — it creates one order and returns one URL.
+- **Nothing extra to deploy inside the library.** It has no webhook server, database or
+  background job. Your backend still persists the attempt, reconciles the Order and owns
+  the webhook state transition.
 
 > **Pre-release.** Not yet published to PyPI, and not yet approved for production
 > traffic. Creating an order and opening its hosted checkout has been exercised against
@@ -142,6 +144,7 @@ handoffs = await checkout.checkout_handoff(
 - Supplied, it is validated and used exactly as given. An invalid value is refused; the
   adapter never quietly mints a replacement, because that would turn a rejected duplicate
   into a second payable order.
+- Supplied keys are limited to 64 characters by the supported Mercado Pago SDK.
 - One key means one operation. A new purchase needs a new key, and Mercado Pago answers a
   reused key carrying a different payload with `HTTP 409 idempotency_key_already_used`.
 - The key is never derived from the session id, an email, or any personal data.
@@ -150,7 +153,17 @@ handoffs = await checkout.checkout_handoff(
   identifier by anyone who can see the seller's Mercado Pago records.
 
 Automatic generation only covers the current call. Idempotency across calls, processes or
-restarts means your backend supplying the same key again.
+restarts means your backend supplying the same key again. The complete seller example
+keeps one active attempt per session and confirmed-cart fingerprint, preserves A → B → A,
+caches a successful handoff, and explicitly closes the attempt only after a terminal
+webhook. As a missed-webhook backstop, it retains the local attempt slightly beyond the
+Order's `P1D` window before rotating its key; rotating earlier could expose two payable
+Orders. Use a durable table rather than its in-memory dictionary.
+
+If a create or cleanup POST may have taken effect but cannot be confirmed, the package
+raises `CheckoutOutcomeUnknown` rather than returning `[]`. Its `idempotency_key` and
+`external_reference` attributes let the host reconcile and retry the same operation. Do
+not catch it as an ordinary fallback: another checkout could leave two payable paths.
 
 ### Out of scope
 
@@ -204,9 +217,9 @@ up, cancel or reconcile — is the **order**; the `pref_id` that appears inside 
    `X-Idempotency-Key`.
 8. Validate the returned Order type, processing mode, initial status, ID, amount,
    currency, reference, and HTTPS checkout URL, then return one `CheckoutHandoff`.
-9. If that validation fails, cancel the order before returning `[]`. It already exists at
-   Mercado Pago, and leaving it would strand a payable order on the seller's account for
-   the whole expiry window.
+9. If that validation fails, cancel the order with its own deterministic idempotency key.
+   Return `[]` only after cancellation is confirmed; otherwise raise
+   `CheckoutOutcomeUnknown` and require reconciliation.
 
 Orders created by this package carry no payer PII, no return URL and no notification
 URL. The hosted checkout collects whatever it needs from the shopper.
@@ -305,6 +318,14 @@ export MERCADOPAGO_LIVE_TEST_CONFIRM='create-order'
 .venv/bin/python examples/live_checkout.py
 ```
 
+That mode also replays the same idempotency key and verifies that the original Order is
+returned. To create one deliberately refused Order and prove its cleanup through a GET:
+
+```bash
+export MERCADOPAGO_LIVE_TEST_CONFIRM='verify-cancellation'
+.venv/bin/python examples/live_checkout.py
+```
+
 Do not commit the token or paste it into tickets, logs, or chat. The generated order
 expires after `P1D`. Open the printed URL in a browser to verify that it reaches the
 Mercado Pago hosted checkout. With Orders API, the expected resource is an **order**,
@@ -314,14 +335,16 @@ to obtain the seller test credential and buyer account exposed for your applicat
 
 ## Troubleshooting
 
-Every failure returns `[]` so the host's own checkout takes over, and the reason is
-logged under the `mercadopago_commerce_agents.checkout` logger. Enable it at `ERROR` and
-`WARNING` to see which gate rejected the handoff.
+Definitive refusals return `[]` so the host's own checkout takes over, and the reason is
+logged under the `mercadopago_commerce_agents.checkout` logger. An outcome that may have
+created or left an Order raises `CheckoutOutcomeUnknown` and must block that fallback.
+Enable the logger at `ERROR` and `WARNING` to observe both paths.
 
 | What you see | What it usually means |
 |---|---|
 | `Order creation failed (HTTP 403)` with Mercado Pago's `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | The account behind the Access Token is not authorised for the Orders API. It is a policy decision taken before the payload is validated, so it says nothing about the request itself — check that the application has Checkout Pro through Orders enabled for that account. |
-| `Order creation failed (HTTP 409)` | The idempotency key was already used with a different payload. A new purchase needs a new key. |
+| `CheckoutOutcomeUnknown` after HTTP 409 | The key already identifies an Order but the adapter cannot safely prove which checkout the caller intended. Reconcile the exception's reference before deciding whether this is a retry or a new purchase. |
+| `CheckoutOutcomeUnknown` | A create or cleanup POST may have taken effect. Stop fallback, reconcile `external_reference`, and reuse the exception's `idempotency_key` for a controlled retry. |
 | `Order creation failed (HTTP 400)` | The request reached the account but failed schema validation. The logged `causes` are Mercado Pago's own codes; look them up in the Orders API reference. |
 | Handoff returns `[]` right after `Order ... did not match the confirmed checkout snapshot` | The catalog's currency is not the seller account's own. Mercado Pago accepts the order and creates it in the account's currency (it is never sent), so the mismatch is only caught on the response — the adapter then cancels that order and falls back. Price the catalog in the account's currency (BRL for MLB, ARS for MLA, ...). |
 | `Refusing to create an order: currency_mismatch` | The catalog records disagree with each other or with the cart — rejected locally, before any API call. |

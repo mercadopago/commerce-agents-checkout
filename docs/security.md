@@ -42,6 +42,12 @@ confirm payment.
 - Reserve or revalidate stock according to the seller's business process.
 - Store the idempotency key durably and derive the expected `external_reference` from it;
   enforce attempt expiry beyond an HTTP header.
+- Treat `CheckoutOutcomeUnknown` as a hard stop: reconcile its external reference and
+  reuse its key for controlled recovery instead of rendering another checkout.
+- Give each attempt an explicit lifecycle. Keep it active across retries and cart
+  navigation, close it after a verified paid, canceled, or expired Order state, and bound
+  retention beyond the Order's expiry in case a terminal webhook is missed. Never rotate
+  its key while the previous checkout can still be payable.
 - Keep Access Tokens and webhook secrets in an approved secrets manager.
 - Apply rate limits and abuse detection before calling `checkout_handoff`.
 - Validate Order webhook `x-signature`, deduplicate events, and retrieve the order by ID.

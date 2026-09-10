@@ -59,7 +59,7 @@ import re
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -134,13 +134,32 @@ class Catalog(Protocol):  # pylint: disable=too-few-public-methods
 _UNREACHABLE = object()
 """A transport failure: the request may or may not have reached Mercado Pago."""
 
-_FAILED = object()
-"""The SDK raised something other than a transport error; already logged."""
-
 
 class _Refused(Exception):
     """A line that cannot be priced honestly. Aborts the handoff; the host's own
     checkout card takes over."""
+
+
+class CheckoutOutcomeUnknown(RuntimeError):
+    """The create or cleanup request may have taken effect remotely.
+
+    Returning the host's fallback checkout in this state could leave two payable
+    checkouts for one purchase. The host must stop that fallback, reconcile by
+    ``external_reference``, and reuse ``idempotency_key`` if it retries.
+
+    The exception text deliberately contains only the opaque external reference. The
+    idempotency key remains available as an attribute for controlled recovery without
+    leaking into an ordinary exception log.
+    """
+
+    def __init__(self, *, idempotency_key: str, external_reference: str, reason: str):
+        self.idempotency_key = idempotency_key
+        self.external_reference = external_reference
+        self.reason = reason
+        super().__init__(
+            "Checkout outcome is unknown for reference "
+            f"{external_reference}; reconcile it before retrying or falling back."
+        )
 
 
 @dataclass(frozen=True)
@@ -245,9 +264,10 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         purchase needs a new key; idempotency across processes or restarts means the
         backend supplying the same key again.
 
-        Returns an empty list — letting the host's own checkout card take over — for
-        every case that is not an order we are confident in: nothing to charge, a
-        line that cannot be priced, an API rejection, or MP being unreachable.
+        Returns an empty list — letting the host's own checkout card take over — only
+        when no order was created or when a refused order was confirmed cancelled.
+        Raises :class:`CheckoutOutcomeUnknown` after any POST whose outcome cannot be
+        proven, because falling back in that state could expose two payable checkouts.
         """
         snapshot = _snapshot(cart)
         if snapshot is None or not snapshot.lines:
@@ -298,7 +318,12 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # The order exists at Mercado Pago even though we refuse to hand it over.
             # Leaving it would strand a payable order on the seller's account for the
             # whole expiry window, so cancel it before falling back.
-            await self._cancel(order.get("id"))
+            if not await self._cancel(order.get("id"), idempotency_key):
+                self._raise_outcome_unknown(
+                    idempotency_key,
+                    body["external_reference"],
+                    "cleanup_not_confirmed",
+                )
             return []
         # No adapter-specific label: the commerce-agents host owns its UI.
         return [CheckoutHandoff(url=checkout_url)]
@@ -316,18 +341,23 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         Raises :class:`_Refused` on anything that cannot be priced.
         """
         items: list[_PricedItem] = []
-        currency: str | None = None
         seen: set[str] = set()
         for line in snapshot.lines:
-            product_id = line.product_id
-            if not _valid_identifier(product_id):
+            if not _valid_identifier(line.product_id):
                 raise _Refused("invalid_product_id")
-            if product_id in seen:
+            if line.product_id in seen:
                 # The caps below are per line, so the same product spread over several
                 # lines would multiply past them. Aggregating silently would change what
                 # the shopper confirmed, so this is a refusal.
                 raise _Refused("duplicate_product")
-            seen.add(product_id)
+            seen.add(line.product_id)
+
+        # The same confirmed products must produce a byte-identical Orders body even if
+        # the host reconstructs its cart in a different insertion order for a retry.
+        # product_id is seller-owned and unique at this point, so it is the stable key.
+        currency: str | None = None
+        for line in sorted(snapshot.lines, key=lambda line: line.product_id):
+            product_id = line.product_id
             record = await self._catalog.get_product_details(session, product_id)
             if record is None:
                 raise _Refused("product_not_found")
@@ -441,29 +471,54 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             return None
         return checkout_url
 
-    async def _cancel(self, order_id: Any) -> None:
-        """Best-effort cancellation of an order we created but refused to hand over.
+    async def _cancel(self, order_id: Any, idempotency_key: str) -> bool:
+        """Cancel a refused order and return whether the API confirmed the cleanup.
 
-        Never raises and never changes the outcome: the handoff has already failed, and
-        the host's own checkout takes over either way. A cancellation that does not land
-        is logged with the order id so the seller can reconcile it by hand.
+        Orders requires an idempotency key on cancellation too. A deterministic key
+        makes a retry safe without reusing the create operation's key. Failure is not a
+        safe fallback: the caller raises :class:`CheckoutOutcomeUnknown` instead.
         """
         if not _valid_identifier(order_id):
             logger.error("Refused an order whose id could not be read; cannot cancel it.")
-            return
+            return False
         try:
-            result = await asyncio.to_thread(self._sdk.order().cancel, order_id)
+            options = self._request_options(_cancel_key(idempotency_key))
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.error(
+                "Could not prepare cancellation for order %s.", _safe_str(order_id)
+            )
+            return False
+        try:
+            result = await asyncio.to_thread(self._sdk.order().cancel, order_id, options)
+        except asyncio.CancelledError:
+            self._raise_outcome_unknown(
+                idempotency_key,
+                _reference(idempotency_key),
+                "cleanup_interrupted",
+            )
         except Exception:  # pylint: disable=broad-exception-caught
             # Same reasoning as _create: SDK errors can carry request URLs and headers.
             logger.error("Could not cancel refused order %s.", _safe_str(order_id))
-            return
+            return False
         status = result.get("status") if isinstance(result, dict) else None
-        if not (isinstance(status, int) and 200 <= status < 300):
+        response = result.get("response") if isinstance(result, dict) else None
+        cleanup_confirmed = (
+            isinstance(status, int)
+            and not isinstance(status, bool)
+            and 200 <= status < 300
+            and isinstance(response, dict)
+            and response.get("id") == order_id
+            and response.get("status") == "canceled"
+        )
+        if not cleanup_confirmed:
             logger.error(
-                "Could not cancel refused order %s (HTTP %s).", _safe_str(order_id), status
+                "Could not confirm cancellation of refused order %s (HTTP %s).",
+                _safe_str(order_id),
+                status,
             )
-            return
+            return False
         logger.info("Cancelled refused order %s.", _safe_str(order_id))
+        return True
 
     async def _create(
         self,
@@ -485,38 +540,34 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # current and future SDK-level settings) and clone its headers before adding
             # the request-scoped idempotency key. Building the options can itself raise —
             # the SDK bounds the header — so it stays inside the handled boundary.
-            options = copy(self._sdk.request_options)
-            # Drop any inherited spelling first: requests matches headers
-            # case-insensitively, so a lingering `X-Idempotency-Key` could otherwise win
-            # on the wire while `external_reference` derives from this call's key.
-            custom_headers = {
-                name: value
-                for name, value in (options.custom_headers or {}).items()
-                if name.lower() != _IDEMPOTENCY_HEADER
-            }
-            custom_headers[_IDEMPOTENCY_HEADER] = idempotency_key
-            options.custom_headers = custom_headers
+            options = self._request_options(idempotency_key)
         except Exception:  # pylint: disable=broad-exception-caught
             logger.error("Could not prepare the request; checkout was not created.")
             return None
 
-        result = await self._post_once(body, options)
+        result = await self._post_once(body, options, idempotency_key)
         if result is _UNREACHABLE:
             logger.warning("Mercado Pago was unreachable; retrying the same request once.")
-            result = await self._post_once(body, options)
+            result = await self._post_once(body, options, idempotency_key)
         if result is _UNREACHABLE:
             logger.error(
                 "Mercado Pago stayed unreachable for reference %s. An order may exist; "
                 "reconcile it by that reference before charging again.",
                 _safe_str(body.get("external_reference")),
             )
-            return None
-        if result is _FAILED:
-            return None
+            self._raise_outcome_unknown(
+                idempotency_key,
+                body["external_reference"],
+                "transport_failure",
+            )
 
         if not isinstance(result, dict):
             logger.error("Mercado Pago returned an invalid SDK response.")
-            return None
+            self._raise_outcome_unknown(
+                idempotency_key,
+                body["external_reference"],
+                "invalid_sdk_response",
+            )
         raw_status = result.get("status")
         status = (
             raw_status
@@ -524,11 +575,14 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             else None
         )
         payload = result.get("response")
-        if (
-            status is None
-            or not 200 <= status < 300
-            or not isinstance(payload, dict)
-        ):
+        if status is None:
+            logger.error("Mercado Pago returned an invalid HTTP status.")
+            self._raise_outcome_unknown(
+                idempotency_key,
+                body["external_reference"],
+                "invalid_sdk_response",
+            )
+        if 400 <= status < 500 and status not in (408, 409):
             logger.error(
                 "Order creation failed (HTTP %s): error=%s causes=%s",
                 status,
@@ -539,9 +593,18 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 _cause_codes(payload),
             )
             return None
+        if not 200 <= status < 300 or not isinstance(payload, dict):
+            logger.error("Order creation outcome is unknown (HTTP %s).", status)
+            self._raise_outcome_unknown(
+                idempotency_key,
+                body["external_reference"],
+                "ambiguous_response",
+            )
         return payload
 
-    async def _post_once(self, body: dict[str, Any], options: Any) -> Any:
+    async def _post_once(
+        self, body: dict[str, Any], options: Any, idempotency_key: str
+    ) -> Any:
         """One attempt. ``_UNREACHABLE`` marks a transport failure, which may still have
         reached Mercado Pago and is therefore safe to replay with the same key."""
         try:
@@ -549,13 +612,49 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # cancelling this coroutine does not cancel the thread: the POST may still
             # land, which is another reason the key must stay stable.
             return await asyncio.to_thread(self._sdk.order().create, body, options)
+        except asyncio.CancelledError:
+            self._raise_outcome_unknown(
+                idempotency_key,
+                body["external_reference"],
+                "create_interrupted",
+            )
         except requests.RequestException:
             return _UNREACHABLE
         except Exception:  # pylint: disable=broad-exception-caught
             # SDK errors can contain request URLs and headers. Keep the fallback safe
             # and avoid propagating or logging those details through the host.
-            logger.error("Unexpected Mercado Pago SDK failure; checkout was not created.")
-            return _FAILED
+            logger.error("Unexpected Mercado Pago SDK failure; outcome is unknown.")
+            self._raise_outcome_unknown(
+                idempotency_key,
+                body["external_reference"],
+                "sdk_failure",
+            )
+
+    def _request_options(self, idempotency_key: str) -> Any:
+        """Clone the SDK options and install exactly one request-scoped key."""
+        options = copy(self._sdk.request_options)
+        # Drop any inherited spelling first: requests matches headers
+        # case-insensitively, so a lingering `X-Idempotency-Key` could otherwise win
+        # on the wire while `external_reference` derives from this call's key.
+        custom_headers = {
+            name: value
+            for name, value in (options.custom_headers or {}).items()
+            if name.lower() != _IDEMPOTENCY_HEADER
+        }
+        custom_headers[_IDEMPOTENCY_HEADER] = idempotency_key
+        options.custom_headers = custom_headers
+        return options
+
+    @staticmethod
+    def _raise_outcome_unknown(
+        idempotency_key: str, external_reference: str, reason: str
+    ) -> NoReturn:
+        """Raise a sanitized recovery signal without chaining SDK secrets."""
+        raise CheckoutOutcomeUnknown(
+            idempotency_key=idempotency_key,
+            external_reference=external_reference,
+            reason=reason,
+        ) from None
 
     @staticmethod
     def _is_checkout_url(url: str) -> bool:
@@ -654,6 +753,11 @@ def _reference(idempotency_key: str) -> str:
     and would let a payment be bound to a session its payer does not own.
     """
     return f"mpca-{uuid5(NAMESPACE_URL, idempotency_key)}"
+
+
+def _cancel_key(idempotency_key: str) -> str:
+    """A stable, operation-specific key for cancelling the created order."""
+    return str(uuid5(NAMESPACE_URL, f"mpca-cancel:{idempotency_key}"))
 
 
 def _decimal(value: Any) -> Decimal | None:

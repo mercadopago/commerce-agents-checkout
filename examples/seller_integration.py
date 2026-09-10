@@ -25,11 +25,19 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import mercadopago
 
-from mercadopago_commerce_agents import MercadoPagoCheckout, external_reference_for
+from mercadopago_commerce_agents import (
+    CheckoutHandoff,
+    MercadoPagoCheckout,
+    external_reference_for,
+)
+
+_ATTEMPT_RETENTION = timedelta(hours=25)
+"""Outlive the Order's P1D expiry by a safety margin before rotating its key."""
 
 # --- what the seller already has -------------------------------------------------
 
@@ -89,6 +97,15 @@ class Session:
     session_id: str
 
 
+@dataclass
+class _CheckoutAttempt:
+    """One active purchase, retained until the host observes a terminal Order state."""
+
+    key: str
+    expires_at: datetime
+    handoffs: tuple[CheckoutHandoff, ...] | None = None
+
+
 # --- the integration itself: two lines ---------------------------------------------
 
 class SellerBackend:
@@ -105,9 +122,10 @@ class SellerBackend:
     def __init__(self, sdk: mercadopago.SDK) -> None:
         self.catalog = SellerCatalog()
         self.mercadopago = MercadoPagoCheckout(sdk=sdk, catalog=self.catalog)
-        # A dict is enough to read; a real deployment needs a durable table, because a
-        # retry may cross a process restart and must find the same key.
-        self._attempts: dict[str, tuple[str, str]] = {}
+        # A dict is enough to read. A real deployment needs a durable checkout_attempt
+        # table keyed by seller/session plus snapshot fingerprint, because a retry may
+        # cross a process restart and A -> B -> A must still find A's original attempt.
+        self._attempts: dict[tuple[str, str], _CheckoutAttempt] = {}
 
     async def get_product_details(self, session: object, product_id: str) -> Product | None:
         """Delegate to the catalog, as a StorefrontBackend already does."""
@@ -115,29 +133,73 @@ class SellerBackend:
 
     async def checkout_handoff(self, session: Session, cart: Cart):
         """Exactly the signature commerce-agents calls."""
-        key = await self.checkout_key(session, cart)
-        return await self.mercadopago.checkout_handoff(
-            session, cart, idempotency_key=key
+        attempt_id, attempt = self._attempt(session, cart)
+        if attempt.handoffs is not None:
+            # A host retry after the adapter returned must not rebuild a body from a
+            # catalog that may have changed. Return the already-issued checkout instead.
+            return list(attempt.handoffs)
+
+        handoffs = await self.mercadopago.checkout_handoff(
+            session, cart, idempotency_key=attempt.key
         )
+        if handoffs:
+            attempt.handoffs = tuple(handoffs)
+        else:
+            # [] is now definitive: no Order exists, or cleanup was confirmed. The next
+            # explicit checkout can start a new operation instead of inheriting this key.
+            self._attempts.pop(attempt_id, None)
+        return handoffs
 
     async def checkout_key(self, session: Session, cart: Cart) -> str:
-        """One key per confirmed cart, reused only while that cart is unchanged.
+        """Return the key for this cart's active checkout attempt.
 
-        Retrying the same confirmed cart must reuse it, or Mercado Pago creates a second
-        payable order. Any change to the cart is a different purchase and needs a new one.
-        Store it before returning: `external_reference_for(key)` is what a webhook will
-        match against later.
+        The record remains active across A -> B -> A and process restarts. A terminal
+        webhook must call ``finish_checkout_attempt``; only then may an intentional new
+        purchase of the same cart receive a new key.
         """
+        return self._attempt(session, cart)[1].key
+
+    def _attempt(
+        self, session: Session, cart: Cart
+    ) -> tuple[tuple[str, str], _CheckoutAttempt]:
+        """Get or durably create the active operation before calling Mercado Pago."""
+        attempt_id = (session.session_id, self._fingerprint(cart))
+        attempt = self._attempts.get(attempt_id)
+        now = datetime.now(timezone.utc)
+        if attempt is None or attempt.expires_at <= now:
+            # Outlive the Order's P1D window by a safety margin: rotating before the
+            # hosted checkout expires could expose two payable Orders. This is only a
+            # missed-webhook backstop; verified terminal state should close it earlier.
+            attempt = _CheckoutAttempt(
+                key=f"order-{uuid4()}",
+                expires_at=now + _ATTEMPT_RETENTION,
+            )
+            self._attempts[attempt_id] = attempt
+        return attempt_id, attempt
+
+    @staticmethod
+    def _fingerprint(cart: Cart) -> str:
+        """Canonical confirmed-cart identity; never an idempotency key by itself."""
         fingerprint = json.dumps(
-            sorted((line.product_id, line.quantity, line.price) for line in cart.items),
+            {
+                "currency": cart.currency,
+                "items": sorted(
+                    (line.product_id, line.quantity, line.price) for line in cart.items
+                ),
+            },
             separators=(",", ":"),
+            sort_keys=True,
         )
-        stored = self._attempts.get(session.session_id)
-        if stored is not None and stored[0] == fingerprint:
-            return stored[1]
-        key = f"order-{uuid4()}"
-        self._attempts[session.session_id] = (fingerprint, key)
-        return key
+        return fingerprint
+
+    async def finish_checkout_attempt(self, session: Session, cart: Cart) -> None:
+        """Close the attempt after a verified paid/canceled/expired Order webhook.
+
+        A later intentional purchase of an identical cart then receives a fresh key.
+        Real hosts update the durable attempt row in the same transaction as their local
+        order state instead of deleting history.
+        """
+        self._attempts.pop((session.session_id, self._fingerprint(cart)), None)
 
 
 # --- afterwards: the part this package deliberately leaves to you ------------------
@@ -162,6 +224,9 @@ async def compare_order_with_your_record(
        is not idempotent will fulfil twice.
     3. **Decide which order status your flow treats as paid**, and apply a valid local
        state transition from whatever state you are in — never a blind overwrite.
+    4. **Close the active checkout attempt after that terminal transition** by calling
+       ``finish_checkout_attempt`` in the same transaction. That is what lets a later
+       intentional purchase of an identical cart receive a new idempotency key.
 
     Never treat a browser redirect or a query parameter as payment evidence.
     """

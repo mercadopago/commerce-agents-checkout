@@ -7,12 +7,18 @@
 for the wiring and for why it needs your catalog.
 """
 
-from .checkout import Catalog, MercadoPagoCheckout, external_reference_for
+from .checkout import (
+    Catalog,
+    CheckoutOutcomeUnknown,
+    MercadoPagoCheckout,
+    external_reference_for,
+)
 from .types import CheckoutHandoff
 
 __all__ = [
     "Catalog",
     "CheckoutHandoff",
+    "CheckoutOutcomeUnknown",
     "MercadoPagoCheckout",
     "external_reference_for",
 ]

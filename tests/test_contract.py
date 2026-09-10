@@ -21,7 +21,7 @@ import unittest
 from dataclasses import MISSING
 from types import SimpleNamespace
 
-from mercadopago_commerce_agents import CheckoutHandoff
+from mercadopago_commerce_agents import CheckoutHandoff, CheckoutOutcomeUnknown
 
 try:  # commerce-agents is an optional, unpublished dependency
     from shopping_agent.enrichment import enrich_checkout
@@ -69,6 +69,29 @@ class ContractTest(unittest.IsolatedAsyncioTestCase):
             [{"url": "https://www.mercadopago.com.br/checkout", "label": "Pay"}],
         )
 
+    async def test_real_enrich_checkout_propagates_an_unknown_outcome(self):
+        """The host must not convert an ambiguous POST into its fallback checkout."""
+        cart = Cart(
+            items=[CartItem(product_id="sku1", title="A thing", price=10.0, quantity=1)]
+        )
+        error = CheckoutOutcomeUnknown(
+            idempotency_key="operation-1",
+            external_reference="mpca-reference",
+            reason="transport_failure",
+        )
+        backend = SimpleNamespace(
+            get_cart=_returning(cart),
+            checkout_handoff=_raising(error),
+        )
+        context = SimpleNamespace(
+            backend=backend, session=SimpleNamespace(session_id="s")
+        )
+
+        with self.assertRaises(CheckoutOutcomeUnknown) as captured:
+            await enrich_checkout(_Payload(), context)
+
+        self.assertIs(captured.exception, error)
+
 
 class _Payload:
     """``enrich_checkout`` only ever calls ``model_dump`` on the payload."""
@@ -80,6 +103,13 @@ class _Payload:
 def _returning(value):
     async def _call(*_args, **_kwargs):
         return value
+
+    return _call
+
+
+def _raising(error):
+    async def _call(*_args, **_kwargs):
+        raise error
 
     return _call
 

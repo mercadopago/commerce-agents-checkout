@@ -6,14 +6,10 @@ and take priority over feature work.
 
 ## Reporting a vulnerability
 
-Report privately through Mercado Pago's security disclosure channel. Do **not** open a
-public GitHub issue, pull request, or discussion for a suspected vulnerability, and do not
-include a real Access Token, a complete `checkout_url`, or any buyer data in a report.
-
-<!-- Maintainers, before the first public release: replace the sentence above with the
-     official disclosure address or program URL, and decide whether to enable GitHub
-     private vulnerability reporting for this repository (it is not enabled today). This
-     comment does not render on GitHub or PyPI. -->
+Report privately through Mercado Libre's official
+[HackerOne program](https://hackerone.com/mercadolibre). Do **not** open a public GitHub
+issue, pull request, or discussion for a suspected vulnerability, and do not include a
+real Access Token, a complete `checkout_url`, or any buyer data in a report.
 
 Please include:
 

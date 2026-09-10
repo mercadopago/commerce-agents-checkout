@@ -11,6 +11,10 @@ Report privately through Mercado Libre's official
 issue, pull request, or discussion for a suspected vulnerability, and do not include a
 real Access Token, a complete `checkout_url`, or any buyer data in a report.
 
+For non-security bugs, documentation improvements, and feature proposals, use this
+repository's public GitHub issues and pull requests. Keep suspected vulnerabilities on
+the private HackerOne path above.
+
 Please include:
 
 - the affected version (`pip show mercadopago-commerce-agents-checkout`);
@@ -31,10 +35,10 @@ project is pre-release today; see [CHANGELOG.md](CHANGELOG.md).
 
 - Anything that lets a cart, session, model-authored text, or Mercado Pago response
   change the amount, currency, items, or destination of a created order.
-- Bypasses of the trusted-catalog repricing, the confirmation gate, the idempotency
-  derivation, or the `checkout_url` host allowlist.
-- Credentials, session identifiers, payloads, PII, or complete checkout URLs reaching
-  logs or exceptions raised out of the adapter.
+- Bypasses of trusted-catalog repricing, confirmation, idempotency or external-reference
+  validation, or the `checkout_url` host allowlist.
+- Credentials, session identifiers, seller references, idempotency keys, payloads, PII,
+  or complete checkout URLs reaching logs or exception messages from the adapter.
 
 ## What is out of scope here
 

@@ -73,7 +73,7 @@ class _FakeSDK:
 class LiveCheckoutTest(unittest.IsolatedAsyncioTestCase):
     """Exercise the script's happy path and its real-cleanup proof shape."""
 
-    async def _run(self, mode):
+    async def _run(self, mode, *, show_checkout_url=False):
         sdk = _FakeSDK()
         output = io.StringIO()
         environment = {
@@ -81,9 +81,12 @@ class LiveCheckoutTest(unittest.IsolatedAsyncioTestCase):
             "MERCADOPAGO_TEST_CURRENCY": "BRL",
             "MERCADOPAGO_LIVE_TEST_CONFIRM": mode,
         }
+        if show_checkout_url:
+            environment["MERCADOPAGO_LIVE_SHOW_CHECKOUT_URL"] = "1"
         with (
             mock.patch.dict(os.environ, environment, clear=True),
             mock.patch.object(live_checkout.mercadopago, "SDK", return_value=sdk),
+            mock.patch.object(output, "isatty", return_value=show_checkout_url),
             redirect_stdout(output),
         ):
             await live_checkout.main()
@@ -95,6 +98,12 @@ class LiveCheckoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(resource.create_calls), 2)
         self.assertEqual(resource.create_calls[0], resource.create_calls[1])
         self.assertIn("Retry verified", output)
+        self.assertIn("URL verified and withheld", output)
+        self.assertNotIn(CHECKOUT_URL, output)
+
+    async def test_create_mode_prints_url_only_after_interactive_opt_in(self):
+        _, output = await self._run("create-order", show_checkout_url=True)
+
         self.assertIn(CHECKOUT_URL, output)
 
     async def test_cancellation_mode_proves_cleanup_without_printing_the_url(self):

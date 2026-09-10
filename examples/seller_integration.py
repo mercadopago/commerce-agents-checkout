@@ -6,12 +6,14 @@
 Read it top to bottom: a catalog, a backend, the wiring, and what to do with the
 webhook afterwards. Nothing here is scaffolding for the example's sake.
 
-    python examples/seller_integration.py            # print the wiring and exit
-    python examples/seller_integration.py --create   # create one real order
+    python examples/seller_integration.py
+    python examples/seller_integration.py --create
+    python examples/seller_integration.py --create --show-sensitive-output
 
 ``--create`` needs ``MERCADOPAGO_ACCESS_TOKEN`` and calls the live API, so point it at a
-test seller. It creates one order for the cart below and prints its checkout URL; the
-order expires after 24 hours and nothing is charged until someone pays it.
+test seller. It creates one order for the cart below but redacts its checkout URL and
+identifiers by default. The explicit output flag works only in an interactive terminal.
+The order expires after 24 hours and nothing is charged until someone pays it.
 
 The cart and session types are defined here on purpose. In a real deployment they are
 commerce-agents' own ``Cart`` and ``ShoppingSessionContext``, and this package never
@@ -33,7 +35,6 @@ import mercadopago
 from mercadopago_commerce_agents import (
     CheckoutHandoff,
     MercadoPagoCheckout,
-    external_reference_for,
 )
 
 _ATTEMPT_RETENTION = timedelta(hours=25)
@@ -102,6 +103,7 @@ class _CheckoutAttempt:
     """One active purchase, retained until the host observes a terminal Order state."""
 
     key: str
+    external_reference: str
     expires_at: datetime
     handoffs: tuple[CheckoutHandoff, ...] | None = None
 
@@ -126,6 +128,10 @@ class SellerBackend:
         # table keyed by seller/session plus snapshot fingerprint, because a retry may
         # cross a process restart and A -> B -> A must still find A's original attempt.
         self._attempts: dict[tuple[str, str], _CheckoutAttempt] = {}
+        # Webhooks carry the Mercado Pago Order ID and external_reference, not the
+        # shopper's current cart. Keep the reverse lookup needed to close the exact
+        # attempt even after the shopper navigates A -> B.
+        self._attempt_ids_by_reference: dict[str, tuple[str, str]] = {}
 
     async def get_product_details(self, session: object, product_id: str) -> Product | None:
         """Delegate to the catalog, as a StorefrontBackend already does."""
@@ -140,14 +146,17 @@ class SellerBackend:
             return list(attempt.handoffs)
 
         handoffs = await self.mercadopago.checkout_handoff(
-            session, cart, idempotency_key=attempt.key
+            session,
+            cart,
+            idempotency_key=attempt.key,
+            external_reference=attempt.external_reference,
         )
         if handoffs:
             attempt.handoffs = tuple(handoffs)
         else:
             # [] is now definitive: no Order exists, or cleanup was confirmed. The next
             # explicit checkout can start a new operation instead of inheriting this key.
-            self._attempts.pop(attempt_id, None)
+            self._discard_attempt(attempt_id)
         return handoffs
 
     async def checkout_key(self, session: Session, cart: Cart) -> str:
@@ -158,6 +167,10 @@ class SellerBackend:
         purchase of the same cart receive a new key.
         """
         return self._attempt(session, cart)[1].key
+
+    async def checkout_reference(self, session: Session, cart: Cart) -> str:
+        """Return the seller Order reference stored with this active attempt."""
+        return self._attempt(session, cart)[1].external_reference
 
     def _attempt(
         self, session: Session, cart: Cart
@@ -170,12 +183,21 @@ class SellerBackend:
             # Outlive the Order's P1D window by a safety margin: rotating before the
             # hosted checkout expires could expose two payable Orders. This is only a
             # missed-webhook backstop; verified terminal state should close it earlier.
+            self._discard_attempt(attempt_id)
             attempt = _CheckoutAttempt(
                 key=f"order-{uuid4()}",
+                external_reference=f"seller-order-{uuid4()}",
                 expires_at=now + _ATTEMPT_RETENTION,
             )
             self._attempts[attempt_id] = attempt
+            self._attempt_ids_by_reference[attempt.external_reference] = attempt_id
         return attempt_id, attempt
+
+    def _discard_attempt(self, attempt_id: tuple[str, str]) -> None:
+        """Remove both indexes for one active attempt."""
+        attempt = self._attempts.pop(attempt_id, None)
+        if attempt is not None:
+            self._attempt_ids_by_reference.pop(attempt.external_reference, None)
 
     @staticmethod
     def _fingerprint(cart: Cart) -> str:
@@ -192,20 +214,22 @@ class SellerBackend:
         )
         return fingerprint
 
-    async def finish_checkout_attempt(self, session: Session, cart: Cart) -> None:
+    async def finish_checkout_attempt(self, external_reference: str) -> None:
         """Close the attempt after a verified paid/canceled/expired Order webhook.
 
         A later intentional purchase of an identical cart then receives a fresh key.
         Real hosts update the durable attempt row in the same transaction as their local
         order state instead of deleting history.
         """
-        self._attempts.pop((session.session_id, self._fingerprint(cart)), None)
+        attempt_id = self._attempt_ids_by_reference.get(external_reference)
+        if attempt_id is not None:
+            self._discard_attempt(attempt_id)
 
 
 # --- afterwards: the part this package deliberately leaves to you ------------------
 
 async def compare_order_with_your_record(
-    order_id: str, stored_key: str, expected_amount: str, expected_currency: str,
+    order_id: str, expected_reference: str, expected_amount: str, expected_currency: str,
     sdk: mercadopago.SDK,
 ) -> dict | None:
     """**Incomplete on purpose — one step of a webhook handler, not the handler.**
@@ -225,8 +249,8 @@ async def compare_order_with_your_record(
     3. **Decide which order status your flow treats as paid**, and apply a valid local
        state transition from whatever state you are in — never a blind overwrite.
     4. **Close the active checkout attempt after that terminal transition** by calling
-       ``finish_checkout_attempt`` in the same transaction. That is what lets a later
-       intentional purchase of an identical cart receive a new idempotency key.
+       ``finish_checkout_attempt(order["external_reference"])`` in the same transaction.
+       That is what lets a later purchase of an identical cart receive a new key.
 
     Never treat a browser redirect or a query parameter as payment evidence.
     """
@@ -235,11 +259,19 @@ async def compare_order_with_your_record(
         return None
     order = result.get("response") or {}
     matches = (
-        order.get("external_reference") == external_reference_for(stored_key)
+        order.get("external_reference") == expected_reference
         and order.get("total_amount") == expected_amount
         and order.get("currency") == expected_currency
     )
     return order if matches else None
+
+
+def _show_sensitive_output() -> bool:
+    """Require an explicit flag and an interactive terminal before printing secrets."""
+    requested = "--show-sensitive-output" in sys.argv
+    if requested and not sys.stdout.isatty():
+        raise SystemExit("--show-sensitive-output requires an interactive terminal")
+    return requested
 
 
 async def main() -> None:
@@ -252,6 +284,8 @@ async def main() -> None:
         print("\nNo order created. Re-run with --create and MERCADOPAGO_ACCESS_TOKEN set.")
         return
 
+    show_sensitive_output = _show_sensitive_output()
+
     token = os.environ.get("MERCADOPAGO_ACCESS_TOKEN")
     if not token:
         raise SystemExit("MERCADOPAGO_ACCESS_TOKEN is required with --create")
@@ -261,9 +295,11 @@ async def main() -> None:
     # commerce-agents calls the two-argument form; the key lives inside the backend.
     # Reading it here is what a host does to persist it alongside its own order record.
     key = await backend.checkout_key(session, cart)
+    external_reference = await backend.checkout_reference(session, cart)
     print("Cart:", [(line.product_id, line.quantity) for line in cart.items])
-    print("Idempotency key to store:", key)
-    print("External reference to match a webhook against:", external_reference_for(key))
+    if show_sensitive_output:
+        print("Idempotency key to store:", key)
+        print("External reference to match a webhook against:", external_reference)
 
     handoffs = await backend.checkout_handoff(session, cart)
 
@@ -272,7 +308,11 @@ async def main() -> None:
         print("Enable the `mercadopago_commerce_agents.checkout` logger to see why.")
         return
 
-    print("\nSend the shopper here:", handoffs[0].url)
+    if show_sensitive_output:
+        print("\nSend the shopper here:", handoffs[0].url)
+    else:
+        print("\nCheckout created. URL and recovery identifiers were not printed.")
+        print("Use --show-sensitive-output in an interactive terminal to display them.")
 
 
 if __name__ == "__main__":

@@ -147,10 +147,7 @@ jobs:
           name: python-package-distributions
           path: dist/
 
-      # Trusted Publishing without a third-party action: mint a short-lived token from
-      # the workflow's own OIDC identity, then upload with twine. Organization policy
-      # permits official actions and native commands; an unapproved third-party action
-      # is what it excludes.
+      # Trusted Publishing uses short-lived OIDC credentials and twine.
       - name: Publish to TestPyPI
         env:
           TWINE_NON_INTERACTIVE: "1"

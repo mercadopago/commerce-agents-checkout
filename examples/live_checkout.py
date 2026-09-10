@@ -4,13 +4,16 @@
 """Create one test Checkout Pro order, or verify cleanup of a refused order.
 
 This is intentionally opt-in because it calls the real Mercado Pago API and creates a
-payable test order. It never prints the access token. See ``docs/testing.md``.
+payable test order. It never prints the access token, and it prints the complete checkout
+URL only after a second explicit opt-in from an interactive terminal. See
+``docs/testing.md``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -113,6 +116,17 @@ class _LiveContext:
     recording_sdk: _RecordingSDK
     currency: str
     idempotency_key: str
+    show_checkout_url: bool
+
+
+def _show_checkout_url() -> bool:
+    """Allow the complete hosted URL only after explicit interactive opt-in."""
+    requested = os.environ.get("MERCADOPAGO_LIVE_SHOW_CHECKOUT_URL") == "1"
+    if requested and not sys.stdout.isatty():
+        raise SystemExit(
+            "MERCADOPAGO_LIVE_SHOW_CHECKOUT_URL=1 requires an interactive terminal"
+        )
+    return requested
 
 
 def _created_order_id(recording_sdk: _RecordingSDK) -> str:
@@ -189,7 +203,10 @@ async def _verify_checkout(
     print(f"Order id: {order_id}")
     print(f"Order status: {response.get('status')}")
     print(f"Integration data: {response.get('integration_data')}")
-    print(f"Checkout Pro URL: {checkout_url}")
+    if context.show_checkout_url:
+        print(f"Checkout Pro URL: {checkout_url}")
+    else:
+        print("Checkout Pro URL verified and withheld from output.")
     print("Retry verified: the same idempotency key returned this same order.")
     print("The test order expires after P1D; do not use this script with production data.")
 
@@ -206,6 +223,8 @@ async def main() -> None:
             "Set MERCADOPAGO_LIVE_TEST_CONFIRM=create-order or "
             "verify-cancellation to create one test order"
         )
+
+    show_checkout_url = _show_checkout_url()
 
     sdk = mercadopago.SDK(token)
     verify_cancellation = confirmation == "verify-cancellation"
@@ -231,6 +250,7 @@ async def main() -> None:
             recording_sdk=recording_sdk,
             currency=currency,
             idempotency_key=idempotency_key,
+            show_checkout_url=show_checkout_url,
         ),
         handoffs,
         order_id,

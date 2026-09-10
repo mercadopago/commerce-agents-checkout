@@ -30,22 +30,18 @@ also owns the checkout-attempt lifecycle described below. What you get from the 
   background job. Your backend still persists the attempt, reconciles the Order and owns
   the webhook state transition.
 
-> **Pre-release.** Not yet published to PyPI, and not yet approved for production
-> traffic. Creating an order and opening its hosted checkout has been exercised against
-> the live API; completing a payment there has not. Use test users until the first
-> release.
-
 ## Requirements
 
 - Python 3.11 or newer.
-- A Mercado Pago application and a backend Access Token.
+- A [Mercado Pago application](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/create-application)
+  and its backend [Access Token](https://www.mercadopago.com/developers/en/docs/your-integrations/credentials).
 - A `StorefrontBackend` implementation that can resolve every cart line from a trusted
   catalog, including the currency each record is priced in.
 - `mercadopago` Python SDK 3.5.0 or newer.
 
 ## Install
 
-After the first PyPI release:
+Install from PyPI:
 
 ```bash
 pip install mercadopago-commerce-agents-checkout
@@ -59,7 +55,7 @@ hosts already reference:
 from mercadopago_commerce_agents import MercadoPagoCheckout  # not ..._checkout
 ```
 
-Until then, install from a checkout of this repository:
+For local development or unreleased changes, install from a checkout of this repository:
 
 ```bash
 python -m pip install -e .
@@ -102,16 +98,17 @@ including what to do with the webhook afterwards, see
 ```bash
 python examples/seller_integration.py            # print the wiring and exit
 python examples/seller_integration.py --create   # create one order against a test seller
+python examples/seller_integration.py --create --show-sensitive-output  # interactive only
 ```
 
 Run those from a clone or the sdist — `examples/` ships in the source archive, not in the
 wheel.
 
-The public surface is two constructor arguments and one per-call option:
+The public surface is two constructor arguments and two per-call options:
 
 ```text
 MercadoPagoCheckout(*, sdk, catalog)
-checkout_handoff(session, cart, *, idempotency_key=None)
+checkout_handoff(session, cart, *, idempotency_key=None, external_reference=None)
 ```
 
 - `sdk`: an already configured official Mercado Pago SDK instance. It owns credentials,
@@ -148,9 +145,7 @@ handoffs = await checkout.checkout_handoff(
 - One key means one operation. A new purchase needs a new key, and Mercado Pago answers a
   reused key carrying a different payload with `HTTP 409 idempotency_key_already_used`.
 - The key is never derived from the session id, an email, or any personal data.
-- Prefer a high-entropy key. `external_reference` is a deterministic UUIDv5 of it, so a
-  guessable key (a sequential order number, say) could be matched back to your internal
-  identifier by anyone who can see the seller's Mercado Pago records.
+- Prefer a high-entropy key and never derive it from shopper PII or the session ID.
 
 Automatic generation only covers the current call. Idempotency across calls, processes or
 restarts means your backend supplying the same key again. The complete seller example
@@ -164,6 +159,37 @@ If a create or cleanup POST may have taken effect but cannot be confirmed, the p
 raises `CheckoutOutcomeUnknown` rather than returning `[]`. Its `idempotency_key` and
 `external_reference` attributes let the host reconcile and retry the same operation. Do
 not catch it as an ordinary fallback: another checkout could leave two payable paths.
+Neither recovery identifier is included in the exception message or adapter logs.
+
+### Seller order reference
+
+`external_reference` is independent from the idempotency key. Pass the identifier your
+backend already uses for the purchase — an ecommerce order number is valid and does not
+need to be a UUID:
+
+```python
+handoffs = await checkout.checkout_handoff(
+    session,
+    cart,
+    idempotency_key=operation_key,
+    external_reference=str(seller_order_id),
+)
+```
+
+Mercado Pago accepts 1–64 letters, digits, hyphens and underscores. When omitted, the
+adapter preserves its original behavior and derives a deterministic default:
+
+```python
+from mercadopago_commerce_agents import external_reference_for
+
+reference = external_reference_for(my_key)  # default only
+```
+
+UUIDv5 is deterministic, not encryption. Store the reference you actually sent and index
+the active checkout attempt by it, so an Order webhook can close the correct attempt even
+if the shopper changed carts. A key generated internally cannot be recovered by the
+caller; production integrations should pass and persist both values. Use an opaque seller
+order identifier, never an email, session ID, or other shopper PII.
 
 ### Out of scope
 
@@ -171,25 +197,11 @@ Webhook handling, persistence, Order reconciliation, fulfillment and payment con
 belong to your backend. This package creates one Order and returns one validated URL; it
 stores nothing and calls nothing back.
 
-The `external_reference` it sends is derived from the idempotency key, and the same
-value is available to you without storing anything here:
-
-```python
-from mercadopago_commerce_agents import external_reference_for
-
-reference = external_reference_for(my_key)   # "mpca-" + uuid5(NAMESPACE_URL, my_key)
-```
-
-Index your own record by that value and an Order webhook matches without any callback
-from this library. It never contains the session id. A key generated internally cannot be
-correlated later, because you never see it — pass your own whenever the Order has to be
-reconcilable.
-
 ## How it talks to Mercado Pago
 
-`POST /v1/orders` with `processing_mode=manual`. The resource it creates — the one to look
-up, cancel or reconcile — is the **order**; the `pref_id` that appears inside the returned
-`checkout_url` belongs to the hosted page and is not something to build on.
+`POST /v1/orders` with `processing_mode=manual`, the only processing mode supported for
+Checkout Pro. The public resource to look up, cancel or reconcile is the **Order** and the
+redirect is the returned `checkout_url`; this flow never calls the Preferences API.
 
 ## What happens during `checkout_handoff`
 
@@ -198,7 +210,8 @@ up, cancel or reconcile — is the **order**; the `pref_id` that appears inside 
    than commerce-agents' own defaults (`max_cart_lines=100`, `max_quantity_per_item=24`):
    configure the upstream gates to 20/10 or a cart valid upstream will silently fall back
    to your own checkout.
-2. Validate the idempotency key, or generate a UUID v4 when none was given.
+2. Validate the idempotency key, or generate a UUID v4 when none was given. Validate the
+   seller's `external_reference`, or derive the backwards-compatible default.
 3. Resolve each product through the host's trusted catalog.
 4. Reject unknown lines unless stock is explicitly `True`, and validate price, currency,
    and quantity with bounded inputs. Derive the currency from those records and require
@@ -211,7 +224,7 @@ up, cancel or reconcile — is the **order**; the `pref_id` that appears inside 
    - the order `total_amount` as a two-decimal string, and each item as `title`,
      `quantity`, and `unit_price` only
    - `expiration_time: P1D`
-   - an `external_reference` derived from the idempotency key
+   - the seller's `external_reference`, or the deterministic default when omitted
    - `integration_data` carrying this adapter's Platform ID
 7. Send the request through `sdk.order().create(...)` with that key as
    `X-Idempotency-Key`.
@@ -250,14 +263,13 @@ Pago's own documentation so nobody has to take our word for it.
 | What | Why you need it | Mercado Pago documentation |
 |---|---|---|
 | Application and Access Token | The credential this package's SDK instance carries. Its account decides the site and therefore the currency. | [Credentials](https://www.mercadopago.com/developers/en/docs/your-integrations/credentials) · [Developer panel](https://www.mercadopago.com/developers/panel/app) |
-| Checkout Pro through Orders enabled | `POST /v1/orders` answers `403 PA_UNAUTHORIZED_RESULT_FROM_POLICIES` for an account that is not authorised for it, before it even validates the payload. | [Create a Checkout Pro order](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/create-order) · [API reference](https://www.mercadopago.com.pe/developers/en/reference/online-payments/checkout-pro/create-order/post) |
 | **Order webhook** | **How you learn a shopper actually paid.** This library returns a URL and stops; nothing here polls or notifies. Configure the notification on the application, then validate the `x-signature` header, deduplicate the event and re-fetch the order before trusting it. | [Webhooks and signature validation](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks) · [IPN, the older mechanism](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/ipn) |
 | Test users | A test seller and a test buyer must belong to the **same application**, or the hosted page refuses with "one of the parties is a test user". | [Test accounts](https://www.mercadopago.com/developers/en/docs/your-integrations/test/accounts) |
 | Test cards | Completing a payment on the hosted page during integration testing. | [Test cards](https://www.mercadopago.com/developers/en/docs/your-integrations/test/cards) · [Integration test guide](https://www.mercadopago.com/developers/en/docs/checkout-pro-orders/integration-test-introduction) |
 
 ### Checkout options this package does not send
 
-The order it creates carries the items, the amount, an opaque reference and a 24-hour
+The order it creates carries the items, the amount, a seller reference and a 24-hour
 expiry — nothing else. These are all supported by the Orders API and are **not** exposed
 here, so the account defaults apply. If a seller needs them, that is a scope decision to
 make deliberately, not something to discover in production:
@@ -300,16 +312,16 @@ python3.12 -m venv .venv
 .venv/bin/isort --check-only --diff src tests examples
 ```
 
-`tests/test_contract.py` is skipped unless commerce-agents is installed. The CI job
-installs the exact pinned upstream commit and runs that contract test as a blocking
-check. See the
+`tests/test_contract.py` is skipped unless commerce-agents is installed. The documented
+contract command installs the exact pinned upstream commit and makes the test mandatory.
+See the
 [testing guide](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/testing.md)
 for both the pinned test and the opt-in real API test.
 
 ## Real Checkout Pro test
 
-The repository includes an explicit, opt-in script that creates one test order, reads
-it back through Orders API, and prints its hosted Checkout Pro URL:
+The repository includes an explicit, opt-in script that creates one test order and reads
+it back through Orders API. The complete hosted URL is withheld by default:
 
 ```bash
 export MERCADOPAGO_TEST_ACCESS_TOKEN='seller-test-access-token'
@@ -319,7 +331,16 @@ export MERCADOPAGO_LIVE_TEST_CONFIRM='create-order'
 ```
 
 That mode also replays the same idempotency key and verifies that the original Order is
-returned. To create one deliberately refused Order and prove its cleanup through a GET:
+returned. To display the URL for a manual browser check, run from an interactive terminal
+with a second explicit opt-in:
+
+```bash
+export MERCADOPAGO_LIVE_SHOW_CHECKOUT_URL=1
+.venv/bin/python examples/live_checkout.py
+```
+
+The script refuses to reveal it when stdout is redirected, piped, or captured by CI. To
+create one deliberately refused Order and prove its cleanup through a GET:
 
 ```bash
 export MERCADOPAGO_LIVE_TEST_CONFIRM='verify-cancellation'
@@ -327,9 +348,9 @@ export MERCADOPAGO_LIVE_TEST_CONFIRM='verify-cancellation'
 ```
 
 Do not commit the token or paste it into tickets, logs, or chat. The generated order
-expires after `P1D`. Open the printed URL in a browser to verify that it reaches the
-Mercado Pago hosted checkout. With Orders API, the expected resource is an **order**,
-not a preference. Follow Mercado Pago's
+expires after `P1D`. When explicitly displayed, open the URL in a browser to verify that
+it reaches the Mercado Pago hosted checkout. With Orders API, the expected resource is
+an **order**, not a preference. Follow Mercado Pago's
 [integration-test guide](https://www.mercadopago.com.pe/developers/en/docs/checkout-pro-orders/integration-test-introduction)
 to obtain the seller test credential and buyer account exposed for your application.
 
@@ -342,7 +363,8 @@ Enable the logger at `ERROR` and `WARNING` to observe both paths.
 
 | What you see | What it usually means |
 |---|---|
-| `Order creation failed (HTTP 403)` with Mercado Pago's `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | The account behind the Access Token is not authorised for the Orders API. It is a policy decision taken before the payload is validated, so it says nothing about the request itself — check that the application has Checkout Pro through Orders enabled for that account. |
+| `Order creation failed (HTTP 403)` with `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | Mercado Pago rejected the account under its current policies; verify the account status and contact Mercado Pago support if it remains blocked. It is not an Orders-API enablement requirement. |
+| `Order creation failed (HTTP 403)` with `forbidden` | The application does not have the permissions/scopes required for the operation. Verify the application and credential configuration. See [Orders integration errors](https://www.mercadopago.com.br/developers/pt/docs/checkout-api-orders/payment-management/integration-errors). |
 | `CheckoutOutcomeUnknown` after HTTP 409 | The key already identifies an Order but the adapter cannot safely prove which checkout the caller intended. Reconcile the exception's reference before deciding whether this is a retry or a new purchase. |
 | `CheckoutOutcomeUnknown` | A create or cleanup POST may have taken effect. Stop fallback, reconcile `external_reference`, and reuse the exception's `idempotency_key` for a controlled retry. |
 | `Order creation failed (HTTP 400)` | The request reached the account but failed schema validation. The logged `causes` are Mercado Pago's own codes; look them up in the Orders API reference. |

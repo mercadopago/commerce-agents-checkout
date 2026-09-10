@@ -20,7 +20,7 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 - Turns a cart the shopping agent assembled into a hosted Checkout Pro order and returns
   the validated `checkout_url`. Two constructor arguments, one method:
   `MercadoPagoCheckout(*, sdk, catalog)` and
-  `checkout_handoff(session, cart, *, idempotency_key=None)`.
+  `checkout_handoff(session, cart, *, idempotency_key=None, external_reference=None)`.
 - Prices every line from the host's own catalog rather than from the cart, and freezes the
   cart's lines, quantities and currency before the first `await`. The cart is filled by a
   model's tool calls, so its prices are a claim to verify, not a fact.
@@ -29,13 +29,14 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 - Identifies the integration to Mercado Pago through `integration_data.platform_id`.
 - Scopes idempotency to one call: a UUIDv4 when none is given, the caller's value used
   verbatim when it is, and a refusal rather than a silent replacement when it is invalid.
-  `external_reference_for(key)` returns the reference the order carries, so a host can
-  match an Order webhook without this package storing anything.
+  Callers may pass their seller Order identifier as `external_reference`; when omitted,
+  `external_reference_for(key)` returns the deterministic default the Order carries.
 - Retries once with the same key after a transport failure, because a lost response does
-  not prove the request had no effect.
+  not prove the request had no effect. A later client error remains indeterminate because
+  it describes only the retry, not whether the first POST created an Order.
 - Raises `CheckoutOutcomeUnknown` instead of returning the host fallback when create or
   cleanup may have taken effect but cannot be proven. The exception carries the key and
-  opaque reference required for controlled recovery.
+  reference required for controlled recovery without including either in its message.
 - Canonicalizes item order by product ID, so a reordered retry keeps the same Orders body.
 - Validates the created order — type, processing mode, status, reference, amount,
   currency, expiry and the checkout host — and cancels the order when that check fails,
@@ -43,6 +44,9 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
   is confirmed for the same Order in `canceled` state.
 - Returns `[]` and logs a bounded reason code on definitive refusals. Indeterminate
   remote outcomes stop fallback until the host reconciles them.
+- Example scripts redact checkout URLs, idempotency keys and external references by
+  default; complete values require explicit opt-in from an interactive terminal.
+- `CheckoutHandoff` redacts its URL from `repr` while preserving it in `model_dump()`.
 
 ### What it deliberately leaves to the host
 

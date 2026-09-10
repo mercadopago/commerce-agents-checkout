@@ -44,11 +44,11 @@ confirmed aborts the handoff.
 
 What this class does not fix
 ---------------------------
-It cannot authenticate the shopper — only the host can. It keeps the caller-supplied
-session id out of the payment record (``external_reference`` is opaque, see
-``_reference``), which stops the payment from being bound to a session id someone else
-chose, but a deployment that leaves ``X-Session-Id`` unauthenticated still has an
-unauthenticated cart. Authenticate the session in the host before wiring this in.
+It cannot authenticate the shopper — only the host can. It never derives payment fields
+from the caller-supplied session id: ``external_reference`` is either the seller's
+explicit business identifier or a stable default derived from the operation key. A
+deployment that leaves ``X-Session-Id`` unauthenticated still has an unauthenticated
+cart. Authenticate the session in the host before wiring this in.
 """
 
 from __future__ import annotations
@@ -75,6 +75,8 @@ logger = logging.getLogger(__name__)
 
 # MP caps an order item's title; longer titles are rejected outright.
 _MAX_TITLE = 256
+# These are adapter safety budgets, not Orders API limits. They bound catalog work and
+# monetary exposure even when the host keeps commerce-agents' more permissive defaults.
 _MAX_CART_ITEMS = 20
 _MAX_QUANTITY = 10
 _MAX_IDENTIFIER = 256
@@ -91,6 +93,7 @@ _MAX_DECIMAL_TEXT = 64
 _AMOUNT_QUANTUM = Decimal("0.01")
 _LOG_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 _CURRENCY = re.compile(r"[A-Z]{3}\Z")
+_EXTERNAL_REFERENCE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 # Checkout Pro Orders uses an ISO 8601 duration, not an absolute preference timestamp.
 # Keeping it relative also makes retries carry an identical body.
@@ -147,9 +150,8 @@ class CheckoutOutcomeUnknown(RuntimeError):
     checkouts for one purchase. The host must stop that fallback, reconcile by
     ``external_reference``, and reuse ``idempotency_key`` if it retries.
 
-    The exception text deliberately contains only the opaque external reference. The
-    idempotency key remains available as an attribute for controlled recovery without
-    leaking into an ordinary exception log.
+    The exception text contains neither identifier. Both remain available as attributes
+    for controlled recovery without leaking into an ordinary exception log.
     """
 
     def __init__(self, *, idempotency_key: str, external_reference: str, reason: str):
@@ -157,8 +159,8 @@ class CheckoutOutcomeUnknown(RuntimeError):
         self.external_reference = external_reference
         self.reason = reason
         super().__init__(
-            "Checkout outcome is unknown for reference "
-            f"{external_reference}; reconcile it before retrying or falling back."
+            "Checkout outcome is unknown; reconcile the operation before retrying or "
+            "falling back."
         )
 
 
@@ -215,9 +217,9 @@ class _PricedItem:  # pylint: disable=too-few-public-methods
 class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
     """Checkout Pro backed by an already configured official Mercado Pago SDK.
 
-    The public surface is deliberately two arguments: the SDK that calls Mercado Pago
-    and the trusted catalog that prices cart lines. Everything else is either derived
-    (the currency comes from the catalog) or scoped to one call (the idempotency key).
+    The constructor surface is deliberately two arguments: the SDK that calls Mercado
+    Pago and the trusted catalog that prices cart lines. Everything else is either
+    derived (the currency comes from the catalog) or scoped to one checkout call.
 
     Persistence, webhook handling, Order reconciliation and payment confirmation belong
     to the seller's backend, not here.
@@ -250,6 +252,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         cart: "Cart",
         *,
         idempotency_key: str | None = None,
+        external_reference: str | None = None,
     ) -> list[CheckoutHandoff]:
         """Drop-in for ``StorefrontBackend.checkout_handoff``.
 
@@ -263,6 +266,12 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         a key with a different payload is refused by Mercado Pago with HTTP 409, so a new
         purchase needs a new key; idempotency across processes or restarts means the
         backend supplying the same key again.
+
+        ``external_reference`` is the seller's business identifier for the Order. It
+        may be an ecommerce order number and does not need to be a UUID. When omitted,
+        the adapter derives a stable opaque value from ``idempotency_key`` for backwards
+        compatibility. Mercado Pago accepts up to 64 letters, digits, hyphens and
+        underscores; invalid values fail closed before any API call.
 
         Returns an empty list — letting the host's own checkout card take over — only
         when no order was created or when a refused order was confirmed cancelled.
@@ -278,6 +287,11 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # Fail closed: generating a replacement here would create an order the
             # caller believes it already deduplicated.
             logger.warning("Refusing to create an order: invalid_idempotency_key")
+            return []
+        if external_reference is None:
+            external_reference = _reference(idempotency_key)
+        elif not _valid_external_reference(external_reference):
+            logger.warning("Refusing to create an order: invalid_external_reference")
             return []
 
         try:
@@ -300,7 +314,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             "processing_mode": "manual",
             "total_amount": total_amount,
             "items": [item.order_payload() for item in items],
-            "external_reference": _reference(idempotency_key),
+            "external_reference": external_reference,
             # An order with no expiry stays payable at yesterday's price after the cart
             # has moved on.
             "expiration_time": _ORDER_EXPIRATION,
@@ -318,7 +332,9 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # The order exists at Mercado Pago even though we refuse to hand it over.
             # Leaving it would strand a payable order on the seller's account for the
             # whole expiry window, so cancel it before falling back.
-            if not await self._cancel(order.get("id"), idempotency_key):
+            if not await self._cancel(
+                order.get("id"), idempotency_key, body["external_reference"]
+            ):
                 self._raise_outcome_unknown(
                     idempotency_key,
                     body["external_reference"],
@@ -471,7 +487,9 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             return None
         return checkout_url
 
-    async def _cancel(self, order_id: Any, idempotency_key: str) -> bool:
+    async def _cancel(
+        self, order_id: Any, idempotency_key: str, external_reference: str
+    ) -> bool:
         """Cancel a refused order and return whether the API confirmed the cleanup.
 
         Orders requires an idempotency key on cancellation too. A deterministic key
@@ -493,7 +511,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         except asyncio.CancelledError:
             self._raise_outcome_unknown(
                 idempotency_key,
-                _reference(idempotency_key),
+                external_reference,
                 "cleanup_interrupted",
             )
         except Exception:  # pylint: disable=broad-exception-caught
@@ -546,14 +564,14 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             return None
 
         result = await self._post_once(body, options, idempotency_key)
-        if result is _UNREACHABLE:
+        prior_transport_failure = result is _UNREACHABLE
+        if prior_transport_failure:
             logger.warning("Mercado Pago was unreachable; retrying the same request once.")
             result = await self._post_once(body, options, idempotency_key)
         if result is _UNREACHABLE:
             logger.error(
-                "Mercado Pago stayed unreachable for reference %s. An order may exist; "
-                "reconcile it by that reference before charging again.",
-                _safe_str(body.get("external_reference")),
+                "Mercado Pago stayed unreachable. An order may exist; reconcile the "
+                "operation before charging again."
             )
             self._raise_outcome_unknown(
                 idempotency_key,
@@ -583,6 +601,19 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 "invalid_sdk_response",
             )
         if 400 <= status < 500 and status not in (408, 409):
+            if prior_transport_failure:
+                # This rejection describes only the retry. The first POST may have
+                # succeeded before its response was lost, so fallback is still unsafe.
+                logger.error(
+                    "Retry after a transport failure was rejected (HTTP %s); the "
+                    "original Order outcome is unknown.",
+                    status,
+                )
+                self._raise_outcome_unknown(
+                    idempotency_key,
+                    body["external_reference"],
+                    "retry_inconclusive",
+                )
             logger.error(
                 "Order creation failed (HTTP %s): error=%s causes=%s",
                 status,
@@ -631,7 +662,13 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             )
 
     def _request_options(self, idempotency_key: str) -> Any:
-        """Clone the SDK options and install exactly one request-scoped key."""
+        """Clone the SDK options and install exactly one request-scoped key.
+
+        ``SDK.order()`` otherwise reuses ``sdk.request_options``. Its ``custom_headers``
+        mapping is mutable, so changing it in place would leak one checkout's key into
+        concurrent calls. Building blank options would lose caller-configured timeout and
+        retry settings; copying preserves them while isolating the request header.
+        """
         options = copy(self._sdk.request_options)
         # Drop any inherited spelling first: requests matches headers
         # case-insensitively, so a lingering `X-Idempotency-Key` could otherwise win
@@ -729,11 +766,17 @@ def _valid_identifier(value: Any) -> bool:
     )
 
 
-def external_reference_for(idempotency_key: str) -> str:
-    """The ``external_reference`` this package sends for a given idempotency key.
+def _valid_external_reference(value: Any) -> bool:
+    """Apply the Orders API's documented business-reference contract locally."""
+    return isinstance(value, str) and _EXTERNAL_REFERENCE.fullmatch(value) is not None
 
-    Public so a host can index its own records by the same value and match an Order
-    webhook without the library storing anything. The algorithm is part of the contract:
+
+def external_reference_for(idempotency_key: str) -> str:
+    """The default ``external_reference`` for a given idempotency key.
+
+    Public so a host that omits the explicit ``external_reference`` argument can index
+    its own records by the same value and match an Order webhook without the library
+    storing anything. The algorithm is part of the contract:
     ``"mpca-" + str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key))``.
 
     A key generated internally — that is, calling ``checkout_handoff`` without one —
@@ -744,13 +787,12 @@ def external_reference_for(idempotency_key: str) -> str:
 
 
 def _reference(idempotency_key: str) -> str:
-    """An opaque ``external_reference``, derived from the operation's idempotency key.
+    """The backwards-compatible default reference derived from the idempotency key.
 
     Deriving it keeps a retry's body byte-identical, which is what the Orders API
-    requires of a reused key. It is a UUIDv5 of the key rather than the key itself: the
-    key may be a host-internal identifier, and Mercado Pago's records are not the place
-    to publish one. Never the session id, which is caller-supplied in the reference host
-    and would let a payment be bound to a session its payer does not own.
+    requires of a reused key. UUIDv5 is deterministic, not encryption: callers that do
+    not want a derived reference should pass their own seller Order identifier. Never
+    derive either value from the unauthenticated session id.
     """
     return f"mpca-{uuid5(NAMESPACE_URL, idempotency_key)}"
 

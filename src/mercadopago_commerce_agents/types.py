@@ -26,7 +26,7 @@ checkout.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -36,7 +36,7 @@ class CheckoutHandoff:
     ``shopping_agent.types.CheckoutHandoff``; ``seller`` is set only by a marketplace
     whose sellers check out separately."""
 
-    url: str
+    url: str = field(repr=False)
     label: str | None = None
     seller: str | None = None
 

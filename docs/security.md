@@ -19,14 +19,18 @@ confirm payment.
 - Quantity magnitude is bounded before integer conversion, including exponent notation.
 - The idempotency key is scoped to one operation: generated as a UUID v4 when absent, and
   never silently replaced when a supplied one is invalid.
-- `external_reference` is a UUIDv5 of that key, so it excludes the raw session ID and any
-  host-internal identifier.
+- `external_reference` is either the seller's validated business identifier or a stable
+  UUIDv5 default derived from the operation key. UUIDv5 is deterministic, not a
+  confidentiality control; neither value may be derived from shopper PII or an
+  unauthenticated session ID.
 - Checkout URLs are restricted to HTTPS and explicit Mercado Pago hosts.
+- `CheckoutHandoff.__repr__` redacts its complete URL while `model_dump()` preserves it
+  for the host's intended redirect path.
 - The Mercado Pago SDK's request options are copied before adding request headers.
 - Dependency floors exclude currently known vulnerable releases in the Requests HTTP
   stack while retaining compatible version ranges.
-- Logs omit credentials, sessions, product identifiers, prices, payloads, full API
-  responses, and checkout URLs.
+- Logs and exception messages omit credentials, sessions, product identifiers, seller
+  references, idempotency keys, prices, payloads, full API responses, and checkout URLs.
 - The created Order's ID, reference, amount, and currency are validated before handoff;
   an order that fails that check is cancelled rather than left payable on the account.
 - No card data, return URL, notification URL, or payer PII is sent at all.
@@ -40,7 +44,8 @@ confirm payment.
 - Re-read price, currency, stock, shipping, discounts, and tax server-side, then refresh
   the cart and obtain confirmation again after any material change.
 - Reserve or revalidate stock according to the seller's business process.
-- Store the idempotency key durably and derive the expected `external_reference` from it;
+- Store the idempotency key and seller `external_reference` durably. When the explicit
+  reference is omitted, store the default returned by `external_reference_for(key)`;
   enforce attempt expiry beyond an HTTP header.
 - Treat `CheckoutOutcomeUnknown` as a hard stop: reconcile its external reference and
   reuse its key for controlled recovery instead of rendering another checkout.
@@ -68,8 +73,8 @@ confirm payment.
       `checkout_url` responses.
 - [ ] Validate webhook signatures, deduplication, order lookup, amount comparison, and
       allowed state transitions end to end.
-- [ ] Confirm logs and monitoring never persist tokens, session IDs, PII, financial
-      payloads, or complete checkout URLs.
+- [ ] Confirm logs and monitoring never persist tokens, session IDs, idempotency keys,
+      seller references, PII, financial payloads, or complete checkout URLs.
 - [ ] Run dependency/SAST scanning against the release artifact.
 - [ ] Obtain security approval before production enablement.
 

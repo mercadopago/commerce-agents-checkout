@@ -35,13 +35,16 @@ Use a disposable path of your choice instead of `/tmp/commerce-agents` when nece
 ## Integration example
 
 `examples/seller_integration.py` is the readable one: a catalog, a backend, the wiring and
-a sketch of the webhook reconciliation. It prints the wiring with no credentials, and
-creates one order with `--create` and a test-seller token.
+a sketch of the webhook reconciliation. It creates one order with `--create` and a
+test-seller token, but redacts the URL, idempotency key and external reference by default.
+Add `--show-sensitive-output` only in an interactive terminal when those values are
+needed for a manual test.
 
 ## Real Orders API and Checkout Pro test
 
 This test performs an external write: it creates one Mercado Pago test order for
-`10.00`, reads that order back, and prints its hosted URL. Use a test seller and buyer created under the **same application** and country —
+`10.00`, reads that order back, and validates its hosted URL without printing it by
+default. Use a test seller and buyer created under the **same application** and country —
 a buyer from another application is refused with "one of the parties is a test user".
 Never use a real seller account, production credential, or real buyer data. Follow the
 [official integration-test guide](https://www.mercadopago.com.pe/developers/en/docs/checkout-pro-orders/integration-test-introduction)
@@ -55,7 +58,10 @@ export MERCADOPAGO_LIVE_TEST_CONFIRM='create-order'
 ```
 
 That mode repeats the create call with the same key and confirms that Mercado Pago returns
-the original Order. A separate opt-in mode creates one Order, makes the response presented
+the original Order. To print the URL for a browser check, run from an interactive terminal
+with `MERCADOPAGO_LIVE_SHOW_CHECKOUT_URL=1`; redirected or captured output is rejected.
+
+A separate opt-in mode creates one Order, makes the response presented
 to the adapter fail post-create validation, and verifies the real cancellation by reading
 the Order back in `canceled` state:
 
@@ -69,8 +75,8 @@ Expected evidence:
 1. The command prints exactly one order ID beginning with the Orders identifier used by
    the API.
 2. `sdk.order().get(order_id)` returns HTTP 200 and the same ID.
-3. Opening the URL displays the Mercado Pago hosted Checkout Pro page and the expected
-   item/amount.
+3. With the separate interactive output opt-in, opening the URL displays the Mercado Pago
+   hosted Checkout Pro page and the expected item/amount.
 4. The order carries `integration_data.platform_id`.
 5. The URL uses HTTPS and a Mercado Pago hostname.
 6. Replaying the same key returns the same Order ID and URL.
@@ -81,7 +87,8 @@ For `verify-cancellation`, the evidence is the created Order ID plus a GET obser
 The script does **not** cover these; verify them in a host that persists state, or as
 separate manual steps:
 
-- persisting the Order snapshot and matching it to `external_reference_for(key)`.
+- persisting the Order snapshot and matching it to the seller's stored
+  `external_reference` (or `external_reference_for(key)` when the default is used).
 
 With Orders API, this validation creates an **order** and returns `checkout_url`. A
 preference and `init_point` belong to the legacy Preferences API and are not expected.

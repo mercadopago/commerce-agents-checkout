@@ -1,14 +1,18 @@
 # Copyright 2026 Mercado Pago
 # SPDX-License-Identifier: Apache-2.0
 
-"""Lifecycle checks for the copyable seller integration example."""
+"""Lifecycle and output checks for the copyable seller integration example."""
 
+import io
+import os
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from mercadopago.config import RequestOptions
 
+from examples import seller_integration
 from examples.seller_integration import Cart, CartLine, SellerBackend, Session
 from mercadopago_commerce_agents import CheckoutHandoff
 
@@ -28,11 +32,12 @@ class SellerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         cart_b = Cart(items=[CartLine("mug", "29.90", 1)])
 
         key_a = await backend.checkout_key(session, cart_a)
+        reference_a = await backend.checkout_reference(session, cart_a)
         self.assertEqual(await backend.checkout_key(session, cart_a), key_a)
         self.assertNotEqual(await backend.checkout_key(session, cart_b), key_a)
         self.assertEqual(await backend.checkout_key(session, cart_a), key_a)
 
-        await backend.finish_checkout_attempt(session, cart_a)
+        await backend.finish_checkout_attempt(reference_a)
 
         self.assertNotEqual(await backend.checkout_key(session, cart_a), key_a)
 
@@ -65,6 +70,68 @@ class SellerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, expected)
         self.assertEqual(second, expected)
         backend.mercadopago.checkout_handoff.assert_awaited_once()
+
+    async def test_webhook_reference_closes_a_after_navigation_to_b(self):
+        backend = self._backend()
+        handoff = [CheckoutHandoff(url="https://www.mercadopago.com.br/checkout")]
+        backend.mercadopago.checkout_handoff = mock.AsyncMock(return_value=handoff)
+        session = Session("session-1")
+        cart_a = Cart(items=[CartLine("tshirt-m", "49.90", 1)])
+        cart_b = Cart(items=[CartLine("mug", "29.90", 1)])
+
+        original_key = await backend.checkout_key(session, cart_a)
+        reference_a = await backend.checkout_reference(session, cart_a)
+        await backend.checkout_handoff(session, cart_a)
+        await backend.checkout_handoff(session, cart_b)
+
+        await backend.finish_checkout_attempt(reference_a)
+        replacement_key = await backend.checkout_key(session, cart_a)
+        await backend.checkout_handoff(session, cart_a)
+
+        self.assertNotEqual(replacement_key, original_key)
+        self.assertEqual(backend.mercadopago.checkout_handoff.await_count, 3)
+
+    async def test_default_create_output_redacts_url_key_and_reference(self):
+        backend = mock.MagicMock()
+        backend.checkout_key = mock.AsyncMock(return_value="private-operation-key")
+        backend.checkout_reference = mock.AsyncMock(return_value="seller-order-private")
+        backend.checkout_handoff = mock.AsyncMock(
+            return_value=[CheckoutHandoff(url="https://www.mercadopago.com.br/private")]
+        )
+        output = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ, {"MERCADOPAGO_ACCESS_TOKEN": TOKEN}, clear=True
+            ),
+            mock.patch.object(seller_integration.sys, "argv", ["example", "--create"]),
+            mock.patch.object(seller_integration.mercadopago, "SDK"),
+            mock.patch.object(seller_integration, "SellerBackend", return_value=backend),
+            redirect_stdout(output),
+        ):
+            await seller_integration.main()
+
+        rendered = output.getvalue()
+        self.assertIn("URL and recovery identifiers were not printed", rendered)
+        self.assertNotIn("private-operation-key", rendered)
+        self.assertNotIn("seller-order-private", rendered)
+        self.assertNotIn("mercadopago.com.br/private", rendered)
+
+    async def test_sensitive_output_requires_an_interactive_terminal(self):
+        output = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ, {"MERCADOPAGO_ACCESS_TOKEN": TOKEN}, clear=True
+            ),
+            mock.patch.object(
+                seller_integration.sys,
+                "argv",
+                ["example", "--create", "--show-sensitive-output"],
+            ),
+            redirect_stdout(output),
+        ):
+            with self.assertRaisesRegex(SystemExit, "interactive terminal"):
+                await seller_integration.main()
 
 
 if __name__ == "__main__":

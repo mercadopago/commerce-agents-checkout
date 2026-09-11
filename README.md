@@ -1,12 +1,13 @@
 # Mercado Pago Checkout Pro for commerce-agents
 
-[Anthropic's commerce-agents](https://github.com/anthropics/commerce-agents) is a shopping
-agent built on Claude: a customer talks to it, it searches your catalog and fills a cart.
-It deliberately stops short of taking money — its `checkout` tool, in Anthropic's words,
-"renders the cart for the host to complete".
+`mercadopago-commerce-agents-checkout` is an independent Mercado Pago integration
+compatible with the `StorefrontBackend` interface from
+[`anthropics/commerce-agents`](https://github.com/anthropics/commerce-agents). It
+implements that project's `checkout_handoff` interface by creating a Checkout Pro Order
+and returning its validated hosted payment link.
 
-**This package completes it with Mercado Pago.** Wire it into the backend you already
-implement for the agent, and the conversation ends with a real Checkout Pro payment link:
+**Not affiliated with, endorsed by, or maintained by Anthropic.** Wire the adapter into
+the backend you already implement for the agent:
 
 ```python
 class MyBackend(StorefrontBackend):
@@ -38,6 +39,14 @@ also owns the checkout-attempt lifecycle described below. What you get from the 
 - A `StorefrontBackend` implementation that can resolve every cart line from a trusted
   catalog, including the currency each record is priced in.
 - `mercadopago` Python SDK 3.5.0 or newer.
+
+## Compatibility
+
+The contract suite validates this adapter against
+[`anthropics/commerce-agents` commit `fd4d592`](https://github.com/anthropics/commerce-agents/commit/fd4d59224ab96b43c6dc6888207c67b3bd5a24cf).
+The upstream packages are needed only for that compatibility test, not at runtime. See
+the [testing guide](https://github.com/mercadopago/commerce-agents-checkout/blob/main/docs/testing.md)
+for the reproducible command.
 
 ## Install
 

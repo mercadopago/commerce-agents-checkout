@@ -99,12 +99,13 @@ _EXTERNAL_REFERENCE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 # Keeping it relative also makes retries carry an identical body.
 _ORDER_EXPIRATION = "P1D"
 
-# Mercado Pago's Platform ID for this adapter, registered as "Commerce Agents Claude".
-# It identifies the integration itself rather than the seller, so it is sent on every
-# order and is not configurable: attribution must not depend on a host remembering to
-# set it. `application_id` is deliberately absent — Orders rejects a caller-supplied one
-# and derives it from the Access Token — and `sponsor` needs a real account id that only
-# a marketplace deployment has.
+# Mercado Pago's fixed Platform ID for this adapter. Its human-readable registry label
+# is managed separately and is not part of the package's public contract. The ID
+# identifies the integration rather than the seller, so it is sent on every order and is
+# not configurable: attribution must not depend on a host remembering to set it.
+# `application_id` is deliberately absent — Orders rejects a caller-supplied one and
+# derives it from the Access Token — and `sponsor` needs a real account id that only a
+# marketplace deployment has.
 _PLATFORM_ID = "dev_9e28fa65abb111f189e77e2ccf36aeec"
 
 # ``checkout_url`` comes back from the API, but it is rendered to the shopper as the

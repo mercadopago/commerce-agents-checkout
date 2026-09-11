@@ -55,10 +55,11 @@ jobs:
       - name: Audit dependencies
         run: |
           pip install "pip-audit==2.9.0"
-          # The root project is installed editable and does not exist on PyPI before
-          # the first release. Audit its resolved dependencies without asking PyPI for
-          # the unpublished root distribution itself.
-          pip-audit --strict --desc --skip-editable
+          # In strict mode, pip-audit correctly fails when it encounters an editable
+          # distribution, even with --skip-editable. Remove only the unpublished root
+          # package; its resolved dependencies remain installed and are audited below.
+          pip uninstall --yes mercadopago-commerce-agents-checkout
+          pip-audit --strict --desc
 
       - name: Lint with Isort
         run: isort --check-only --diff src tests examples

@@ -19,9 +19,8 @@ confirm payment.
 - Quantity magnitude is bounded before integer conversion, including exponent notation.
 - The idempotency key is scoped to one operation: generated as a UUID v4 when absent, and
   never silently replaced when a supplied one is invalid.
-- `external_reference` is either the seller's validated business identifier or a stable
-  UUIDv5 default derived from the operation key. UUIDv5 is deterministic, not a
-  confidentiality control; neither value may be derived from shopper PII or an
+- `external_reference` is omitted unless the seller supplies a validated business
+  identifier. It is never derived from the operation key, shopper PII, or an
   unauthenticated session ID.
 - Checkout URLs are restricted to HTTPS and explicit Mercado Pago hosts.
 - `CheckoutHandoff.__repr__` redacts its complete URL while `model_dump()` preserves it
@@ -31,8 +30,9 @@ confirm payment.
   stack while retaining compatible version ranges.
 - Logs and exception messages omit credentials, sessions, product identifiers, seller
   references, idempotency keys, prices, payloads, full API responses, and checkout URLs.
-- The created Order's ID, reference, amount, and currency are validated before handoff;
-  an order that fails that check is cancelled rather than left payable on the account.
+- The created Order's ID, amount, currency, and supplied reference are validated before
+  handoff; an order that fails that check is cancelled rather than left payable on the
+  account.
 - No card data, return URL, notification URL, or payer PII is sent at all.
 
 ## Responsibilities of the host application
@@ -44,21 +44,28 @@ confirm payment.
 - Re-read price, currency, stock, shipping, discounts, and tax server-side, then refresh
   the cart and obtain confirmation again after any material change.
 - Reserve or revalidate stock according to the seller's business process.
-- Store the idempotency key and seller `external_reference` durably. When the explicit
-  reference is omitted, store the default returned by `external_reference_for(key)`;
-  enforce attempt expiry beyond an HTTP header.
-- Treat `CheckoutOutcomeUnknown` as a hard stop: reconcile its external reference and
-  reuse its key for controlled recovery instead of rendering another checkout.
+- Store the idempotency key durably and enforce attempt expiry beyond an HTTP header.
+  Every webhook must be associated server-side with exactly one persisted attempt.
+  Supplying and storing the seller's own `external_reference` is the normal production
+  path; omit it only if the host already persists an independent Mercado Pago
+  Order-ID-to-attempt mapping. Amount and currency are validation fields, not correlation
+  keys.
+- Treat `CheckoutOutcomeUnknown` as a hard stop: reuse its key for controlled recovery
+  instead of rendering another checkout. Reconcile its external reference only when the
+  seller supplied one; use its Order ID only when failed cleanup exposes one. None of
+  those identifiers belongs in logs.
 - Give each attempt an explicit lifecycle. Keep it active across retries and cart
   navigation, close it after a verified paid, canceled, or expired Order state, and bound
   retention beyond the Order's expiry in case a terminal webhook is missed. Never rotate
   its key while the previous checkout can still be payable.
 - Keep Access Tokens and webhook secrets in an approved secrets manager.
 - Apply rate limits and abuse detection before calling `checkout_handoff`.
-- Validate Order webhook `x-signature`, deduplicate events, and retrieve the order by ID.
+- Validate Order webhook `x-signature`, deduplicate events, map the Order to exactly one
+  persisted attempt, and retrieve the order by ID.
   The signature contract is in Mercado Pago's
   [Webhooks guide](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks).
-- Compare the authoritative amount/reference before changing local order state.
+- Compare the authoritative amount and currency, plus the correlated seller reference
+  when one was supplied, before changing local order state.
 - Treat redirects as navigation only, never proof of payment.
 
 ## Security review checklist
@@ -71,10 +78,11 @@ confirm payment.
 - [ ] Verify the Mercado Pago checkout-host allowlist for every supported country.
 - [ ] Exercise malformed quantities, prices, catalog failures, API failures, and hostile
       `checkout_url` responses.
-- [ ] Validate webhook signatures, deduplication, order lookup, amount comparison, and
-      allowed state transitions end to end.
-- [ ] Confirm logs and monitoring never persist tokens, session IDs, idempotency keys,
-      seller references, PII, financial payloads, or complete checkout URLs.
+- [ ] Validate webhook signatures, deduplication, authoritative attempt correlation,
+      order lookup, amount comparison, and allowed state transitions end to end.
+- [ ] Confirm logs and monitoring never persist tokens, session IDs, Order IDs,
+      idempotency keys, seller references, PII, financial payloads, or complete checkout
+      URLs.
 - [ ] Run dependency/SAST scanning against the release artifact.
 - [ ] Obtain security approval before production enablement.
 

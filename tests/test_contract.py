@@ -76,7 +76,6 @@ class ContractTest(unittest.IsolatedAsyncioTestCase):
         )
         error = CheckoutOutcomeUnknown(
             idempotency_key="operation-1",
-            external_reference="mpca-reference",
             reason="transport_failure",
         )
         backend = SimpleNamespace(

@@ -165,16 +165,18 @@ Order's `P1D` window before rotating its key; rotating earlier could expose two 
 Orders. Use a durable table rather than its in-memory dictionary.
 
 If a create or cleanup POST may have taken effect but cannot be confirmed, the package
-raises `CheckoutOutcomeUnknown` rather than returning `[]`. Its `idempotency_key` and
-`external_reference` attributes let the host reconcile and retry the same operation. Do
-not catch it as an ordinary fallback: another checkout could leave two payable paths.
-Neither recovery identifier is included in the exception message or adapter logs.
+raises `CheckoutOutcomeUnknown` rather than returning `[]`. Its `idempotency_key` lets
+the host retry the same operation; `external_reference` contains the seller reference
+only when one was supplied, and `order_id` is populated only when failed cleanup had
+already identified the Order. Do not catch it as an ordinary fallback: another checkout
+could leave two payable paths. Recovery identifiers are never included in the exception
+message or adapter logs.
 
 ### Seller order reference
 
-`external_reference` is independent from the idempotency key. Pass the identifier your
-backend already uses for the purchase — an ecommerce order number is valid and does not
-need to be a UUID:
+`external_reference` is an optional correlation field independent from the idempotency
+key. Pass it only when your backend already has a business identifier for the purchase —
+an ecommerce order number is valid and does not need to be a UUID:
 
 ```python
 handoffs = await checkout.checkout_handoff(
@@ -186,19 +188,11 @@ handoffs = await checkout.checkout_handoff(
 ```
 
 Mercado Pago accepts 1–64 letters, digits, hyphens and underscores. When omitted, the
-adapter preserves its original behavior and derives a deterministic default:
-
-```python
-from mercadopago_commerce_agents import external_reference_for
-
-reference = external_reference_for(my_key)  # default only
-```
-
-UUIDv5 is deterministic, not encryption. Store the reference you actually sent and index
-the active checkout attempt by it, so an Order webhook can close the correct attempt even
-if the shopper changed carts. A key generated internally cannot be recovered by the
-caller; production integrations should pass and persist both values. Use an opaque seller
-order identifier, never an email, session ID, or other shopper PII.
+adapter omits the field completely; it does not derive a business identifier from the
+idempotency key. The normal production path is to pass and persist an opaque seller Order
+identifier, never an email, session ID, or other shopper PII. Omitting it is supported
+only when the host has another authoritative Order-to-attempt mapping maintained outside
+this adapter.
 
 ### Out of scope
 
@@ -219,8 +213,8 @@ redirect is the returned `checkout_url`; this flow never calls the Preferences A
    than commerce-agents' own defaults (`max_cart_lines=100`, `max_quantity_per_item=24`):
    configure the upstream gates to 20/10 or a cart valid upstream will silently fall back
    to your own checkout.
-2. Validate the idempotency key, or generate a UUID v4 when none was given. Validate the
-   seller's `external_reference`, or derive the backwards-compatible default.
+2. Validate the idempotency key, or generate a UUID v4 when none was given. Validate a
+   supplied seller `external_reference`; omit the field when none was supplied.
 3. Resolve each product through the host's trusted catalog.
 4. Reject unknown lines unless stock is explicitly `True`, and validate price, currency,
    and quantity with bounded inputs. Derive the currency from those records and require
@@ -233,12 +227,13 @@ redirect is the returned `checkout_url`; this flow never calls the Preferences A
    - the order `total_amount` as a two-decimal string, and each item as `title`,
      `quantity`, and `unit_price` only
    - `expiration_time: P1D`
-   - the seller's `external_reference`, or the deterministic default when omitted
+   - the seller's `external_reference` only when explicitly supplied
    - `integration_data` carrying this adapter's Platform ID
 7. Send the request through `sdk.order().create(...)` with that key as
    `X-Idempotency-Key`.
 8. Validate the returned Order type, processing mode, initial status, ID, amount,
-   currency, reference, and HTTPS checkout URL, then return one `CheckoutHandoff`.
+   currency, the reference when one was supplied, and the HTTPS checkout URL; then return
+   one `CheckoutHandoff`.
 9. If that validation fails, cancel the order with its own deterministic idempotency key.
    Return `[]` only after cancellation is confirmed; otherwise raise
    `CheckoutOutcomeUnknown` and require reconciliation.
@@ -278,10 +273,11 @@ Pago's own documentation so nobody has to take our word for it.
 
 ### Checkout options this package does not send
 
-The order it creates carries the items, the amount, a seller reference and a 24-hour
-expiry — nothing else. These are all supported by the Orders API and are **not** exposed
-here, so the account defaults apply. If a seller needs them, that is a scope decision to
-make deliberately, not something to discover in production:
+The order it creates always carries the items, the amount and a 24-hour expiry. A seller
+reference is included only when explicitly supplied. The options below are supported by
+the Orders API but are **not** exposed here, so the account defaults apply. If a seller
+needs them, that is a scope decision to make deliberately, not something to discover in
+production:
 
 | Not sent | Consequence today | Reference |
 |---|---|---|
@@ -295,10 +291,13 @@ make deliberately, not something to discover in production:
 
 A handoff means Mercado Pago created an order and returned a hosted checkout. It does not
 mean the buyer paid. Configure the **Order** webhook on your Mercado Pago application,
-then validate `x-signature`, deduplicate the event, fetch `/v1/orders/{id}`, and compare
-the authoritative amount, currency and `external_reference` against what you stored for
-that idempotency key before changing local state. A browser redirect is never payment
-evidence.
+then validate `x-signature`, deduplicate the event, and associate its Order with exactly
+one persisted checkout attempt before changing local state. Supplying and storing
+`external_reference` is the normal production correlation path; omit it only when the
+host already has an independent Mercado Pago Order-ID-to-attempt mapping maintained
+outside this adapter. After that association, fetch `/v1/orders/{id}` and compare the
+authoritative amount and currency. Amount, currency, browser redirects, and query
+parameters are never correlation keys or payment evidence.
 
 The official SDK exposes `mercadopago.webhook.WebhookSignatureValidator`. The current
 signature contract, the `x-signature` header format and the list of notification topics
@@ -374,10 +373,10 @@ Enable the logger at `ERROR` and `WARNING` to observe both paths.
 |---|---|
 | `Order creation failed (HTTP 403)` with `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` | Mercado Pago rejected the account under its current policies; verify the account status and contact Mercado Pago support if it remains blocked. It is not an Orders-API enablement requirement. |
 | `Order creation failed (HTTP 403)` with `forbidden` | The application does not have the permissions/scopes required for the operation. Verify the application and credential configuration. See [Orders integration errors](https://www.mercadopago.com.br/developers/pt/docs/checkout-api-orders/payment-management/integration-errors). |
-| `CheckoutOutcomeUnknown` after HTTP 409 | The key already identifies an Order but the adapter cannot safely prove which checkout the caller intended. Reconcile the exception's reference before deciding whether this is a retry or a new purchase. |
-| `CheckoutOutcomeUnknown` | A create or cleanup POST may have taken effect. Stop fallback, reconcile `external_reference`, and reuse the exception's `idempotency_key` for a controlled retry. |
+| `CheckoutOutcomeUnknown` after HTTP 409 | The key already identifies an Order but the adapter cannot safely prove which checkout the caller intended. Stop fallback and determine whether this is a retry or a new purchase; use the optional seller reference when one was supplied. |
+| `CheckoutOutcomeUnknown` | A create or cleanup POST may have taken effect. Stop fallback and reuse the exception's `idempotency_key` for a controlled retry. Its `external_reference` is available only when the seller supplied one; `order_id` is available only when cleanup had already identified the Order. |
 | `Order creation failed (HTTP 400)` | The request reached the account but failed schema validation. The logged `causes` are Mercado Pago's own codes; look them up in the Orders API reference. |
-| Handoff returns `[]` right after `Order ... did not match the confirmed checkout snapshot` | The catalog's currency is not the seller account's own. Mercado Pago accepts the order and creates it in the account's currency (it is never sent), so the mismatch is only caught on the response — the adapter then cancels that order and falls back. Price the catalog in the account's currency (BRL for MLB, ARS for MLA, ...). |
+| Handoff returns `[]` right after `Mercado Pago returned an order that did not match the snapshot` | The catalog's currency is not the seller account's own. Mercado Pago accepts the order and creates it in the account's currency (it is never sent), so the mismatch is only caught on the response — the adapter then cancels that order and falls back. Price the catalog in the account's currency (BRL for MLB, ARS for MLA, ...). |
 | `Refusing to create an order: currency_mismatch` | The catalog records disagree with each other or with the cart — rejected locally, before any API call. |
 | `Refusing to create an order: cart_reconfirmation_required` | The catalog price moved after the shopper confirmed. Refresh the cart and ask for confirmation again; the library will not silently charge the new amount. |
 | `Refusing to create an order: invalid_catalog_record` | `get_product_details` returned something without `title`, `price`, `currency` or `in_stock` — returning a `dict` instead of an object is the usual cause. |

@@ -30,20 +30,22 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 - Scopes idempotency to one call: a UUIDv4 when none is given, the caller's value used
   verbatim when it is, and a refusal rather than a silent replacement when it is invalid.
   Callers may pass their seller Order identifier as `external_reference`; when omitted,
-  `external_reference_for(key)` returns the deterministic default the Order carries.
+  the field is omitted from the Orders payload.
 - Retries once with the same key after a transport failure, because a lost response does
   not prove the request had no effect. A later client error remains indeterminate because
   it describes only the retry, not whether the first POST created an Order.
 - Raises `CheckoutOutcomeUnknown` instead of returning the host fallback when create or
   cleanup may have taken effect but cannot be proven. The exception carries the key and
-  reference required for controlled recovery without including either in its message.
+  optional seller reference, plus a known Order ID after failed cleanup, for controlled
+  recovery without including those identifiers in its message or adapter logs.
 - Canonicalizes item order by product ID, so a reordered retry keeps the same Orders body.
-- Validates the created order — type, processing mode, status, reference, amount,
-  currency, expiry and the checkout host — and cancels the order when that check fails,
-  using a separate deterministic idempotency key. Fallback is allowed only after cleanup
-  is confirmed for the same Order in `canceled` state.
+- Validates the created order — type, processing mode, status, amount, currency, expiry,
+  the optional supplied reference and the checkout host — and cancels the order when that
+  check fails, using a separate deterministic idempotency key. Fallback is allowed only
+  after cleanup is confirmed for the same Order in `canceled` state.
 - Returns `[]` and logs a bounded reason code on definitive refusals. Indeterminate
-  remote outcomes stop fallback until the host reconciles them.
+  remote outcomes stop fallback until the host reconciles them. Payment and recovery
+  identifiers are excluded from adapter logs.
 - Example scripts redact checkout URLs, idempotency keys and external references by
   default; complete values require explicit opt-in from an interactive terminal.
 - `CheckoutHandoff` redacts its URL from `repr` while preserving it in `model_dump()`.

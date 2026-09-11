@@ -1,7 +1,7 @@
 # Copyright 2026 Mercado Pago
 # SPDX-License-Identifier: Apache-2.0
 
-"""A minimal, complete seller integration — the shape of a real one, in one file.
+"""An end-to-end seller integration — the shape of a real one, in one file.
 
 Read it top to bottom: a catalog, a backend, the wiring, and what to do with the
 webhook afterwards. Nothing here is scaffolding for the example's sake.
@@ -14,6 +14,10 @@ webhook afterwards. Nothing here is scaffolding for the example's sake.
 test seller. It creates one order for the cart below but redacts its checkout URL and
 identifiers by default. The explicit output flag works only in an interactive terminal.
 The order expires after 24 hours and nothing is charged until someone pays it.
+
+Unlike the README's minimal handoff, this advanced example opts into a seller-owned
+``external_reference`` so its webhook can map the Mercado Pago Order back to one exact
+persisted checkout attempt.
 
 The cart and session types are defined here on purpose. In a real deployment they are
 commerce-agents' own ``Cart`` and ``ShoppingSessionContext``, and this package never

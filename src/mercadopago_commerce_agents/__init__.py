@@ -11,7 +11,6 @@ from .checkout import (
     Catalog,
     CheckoutOutcomeUnknown,
     MercadoPagoCheckout,
-    external_reference_for,
 )
 from .types import CheckoutHandoff
 
@@ -20,5 +19,4 @@ __all__ = [
     "CheckoutHandoff",
     "CheckoutOutcomeUnknown",
     "MercadoPagoCheckout",
-    "external_reference_for",
 ]

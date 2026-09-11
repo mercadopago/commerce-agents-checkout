@@ -39,9 +39,10 @@ class _FakeOrder:
                 "currency": "BRL",
                 "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
-                "external_reference": body["external_reference"],
                 "integration_data": body["integration_data"],
             }
+            if "external_reference" in body:
+                self.order["external_reference"] = body["external_reference"]
         return {"status": 201, "response": dict(self.order)}
 
     def cancel(self, order_id, request_options=None):

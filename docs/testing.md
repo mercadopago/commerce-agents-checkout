@@ -87,8 +87,9 @@ For `verify-cancellation`, the evidence is the created Order ID plus a GET obser
 The script does **not** cover these; verify them in a host that persists state, or as
 separate manual steps:
 
-- persisting the Order snapshot and matching it to the seller's stored
-  `external_reference` (or `external_reference_for(key)` when the default is used).
+- persisting the Order snapshot and mapping each webhook to exactly one attempt; the
+  normal production path matches a seller-supplied `external_reference`, while hosts
+  that omit it need another authoritative Order-ID-to-attempt mapping.
 
 With Orders API, this validation creates an **order** and returns `checkout_url`. A
 preference and `init_point` belong to the legacy Preferences API and are not expected.

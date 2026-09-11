@@ -18,31 +18,35 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 ### What it does
 
 - Turns a cart the shopping agent assembled into a hosted Checkout Pro order and returns
-  the validated `checkout_url`. Two constructor arguments, one method:
+  the validated `checkout_url`. Two constructor arguments, one adapter method with two
+  required keyword-only identifiers:
   `MercadoPagoCheckout(*, sdk, catalog)` and
-  `checkout_handoff(session, cart, *, idempotency_key=None, external_reference=None)`.
+  `checkout_handoff(session, cart, *, external_reference, idempotency_key)`. The upstream
+  `StorefrontBackend` wrapper keeps its two-argument `(session, cart)` contract.
 - Prices every line from the host's own catalog rather than from the cart, and freezes the
   cart's lines, quantities and currency before the first `await`. The cart is filled by a
   model's tool calls, so its prices are a claim to verify, not a fact.
 - Derives the currency from those catalog records; the cart and the created order must
   agree with them.
 - Identifies the integration to Mercado Pago through `integration_data.platform_id`.
-- Scopes idempotency to one call: a UUIDv4 when none is given, the caller's value used
-  verbatim when it is, and a refusal rather than a silent replacement when it is invalid.
-  Callers may pass their seller Order identifier as `external_reference`; when omitted,
-  the field is omitted from the Orders payload.
+- Requires the host to create and persist an idempotency key and seller Order reference
+  before calling, validates both, and uses them verbatim. Invalid values are refused rather
+  than silently replaced, and the same pair must be reused for retries.
 - Retries once with the same key after a transport failure, because a lost response does
   not prove the request had no effect. A later client error remains indeterminate because
   it describes only the retry, not whether the first POST created an Order.
 - Raises `CheckoutOutcomeUnknown` instead of returning the host fallback when create or
   cleanup may have taken effect but cannot be proven. The exception carries the key and
-  optional seller reference, plus a known Order ID after failed cleanup, for controlled
+  required seller reference, plus a known Order ID after failed cleanup, for controlled
   recovery without including those identifiers in its message or adapter logs.
 - Canonicalizes item order by product ID, so a reordered retry keeps the same Orders body.
 - Validates the created order — type, processing mode, status, amount, currency, expiry,
-  the optional supplied reference and the checkout host — and cancels the order when that
+  the required seller reference and the checkout host — and cancels the order when that
   check fails, using a separate deterministic idempotency key. Fallback is allowed only
   after cleanup is confirmed for the same Order in `canceled` state.
+- Records the live integration observation that omitting `external_reference` returned
+  HTTP 400 `required_properties` on the tested Checkout Pro Orders path, while avoiding a
+  broader claim than the current published API and SDK contracts support.
 - Returns `[]` and logs a bounded reason code on definitive refusals. Indeterminate
   remote outcomes stop fallback until the host reconciles them. Payment and recovery
   identifiers are excluded from adapter logs.

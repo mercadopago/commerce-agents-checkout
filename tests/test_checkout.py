@@ -16,7 +16,6 @@ import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
-from uuid import UUID
 
 import mercadopago
 import requests
@@ -33,6 +32,8 @@ from mercadopago_commerce_agents import checkout as checkout_module
 
 TOKEN = "test-access-token"  # not a credential: no request leaves the process
 CHECKOUT_URL = "https://www.mercadopago.com.br/checkout/v1/redirect?order_id=ORD-1"
+EXTERNAL_REFERENCE = "seller-order-1"
+IDEMPOTENCY_KEY = "operation-1"
 
 
 class _Line:
@@ -104,8 +105,7 @@ class _Recorder:
                 "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
             }
-            if "external_reference" in body:
-                response["external_reference"] = body["external_reference"]
+            response["external_reference"] = body["external_reference"]
         return {"status": self.status, "response": response}
 
     @property
@@ -145,8 +145,7 @@ class _FakeHttpClient(HttpClient):
                 "total_amount": body["total_amount"],
             },
         }
-        if "external_reference" in body:
-            response["response"]["external_reference"] = body["external_reference"]
+        response["response"]["external_reference"] = body["external_reference"]
         return response
 
 
@@ -167,6 +166,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         return MercadoPagoCheckout(sdk=sdk, **kwargs)
 
+    async def _handoff(self, checkout, session, cart, **kwargs):
+        """Call the real public method with one stable, valid attempt pair by default."""
+        kwargs.setdefault("external_reference", EXTERNAL_REFERENCE)
+        kwargs.setdefault("idempotency_key", IDEMPOTENCY_KEY)
+        return await checkout.checkout_handoff(session, cart, **kwargs)
+
     # -- the Critical finding: the charge must not come from the cart --------------
 
     async def test_price_change_requires_fresh_confirmation(self):
@@ -175,7 +180,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         catalog = _Catalog(sku1=_Record(price=100.0))
         checkout = self._checkout(recorder, catalog=catalog)
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1", price=0.01))
         )
 
@@ -187,7 +193,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         catalog = _Catalog(sku1=_Record(title="Catalog title"))
         checkout = self._checkout(recorder, catalog=catalog)
 
-        await checkout.checkout_handoff(
+        await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1", title="<model authored>"))
         )
 
@@ -199,7 +206,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             recorder, catalog=_Catalog(sku1=_Record(price="100.00"))
         )
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1", price="not-a-number"))
         )
 
@@ -212,13 +220,13 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             self._checkout(_Recorder())
 
     def test_public_surface_stays_minimal(self):
-        """The reviewed contract: two constructor arguments, two per-call options."""
+        """The reviewed contract: two constructor and two required per-call arguments."""
         self.assertEqual(
             list(inspect.signature(MercadoPagoCheckout).parameters), ["sdk", "catalog"]
         )
         self.assertEqual(
             list(inspect.signature(MercadoPagoCheckout.checkout_handoff).parameters),
-            ["self", "session", "cart", "idempotency_key", "external_reference"],
+            ["self", "session", "cart", "external_reference", "idempotency_key"],
         )
         # Names alone would stay green if the `*` markers were dropped, which would
         # change the contract the README documents.
@@ -230,13 +238,54 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(handoff[name].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         for name in ("idempotency_key", "external_reference"):
             self.assertEqual(handoff[name].kind, inspect.Parameter.KEYWORD_ONLY)
-            self.assertIsNone(handoff[name].default)
+            self.assertIs(handoff[name].default, inspect.Parameter.empty)
+
+    async def test_requires_both_attempt_identifiers_as_keywords(self):
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+        session = _Session()
+        cart = _Cart(_Line("sku1"))
+
+        for supplied in (
+            {},
+            {"external_reference": EXTERNAL_REFERENCE},
+            {"idempotency_key": IDEMPOTENCY_KEY},
+        ):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(TypeError):
+                    await checkout.checkout_handoff(session, cart, **supplied)
+
+        with self.assertRaises(TypeError):
+            await checkout.checkout_handoff(
+                session, cart, EXTERNAL_REFERENCE, IDEMPOTENCY_KEY
+            )
+        self.assertEqual(recorder.calls, [])
+
+    async def test_invalid_attempt_identifiers_fail_before_the_cart_is_read(self):
+        class _UnreadableCart:
+            @property
+            def items(self):
+                raise AssertionError("the cart must not be read")
+
+        recorder = _Recorder()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+        for supplied in (
+            {"external_reference": None, "idempotency_key": IDEMPOTENCY_KEY},
+            {"external_reference": EXTERNAL_REFERENCE, "idempotency_key": None},
+        ):
+            with self.subTest(supplied=supplied):
+                with self.assertLogs(checkout_module.logger, "WARNING"):
+                    handoffs = await checkout.checkout_handoff(
+                        _Session(), _UnreadableCart(), **supplied
+                    )
+                self.assertEqual(handoffs, [])
+        self.assertEqual(recorder.calls, [])
 
     async def test_refuses_unknown_product(self):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog())
 
-        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("ghost")))
+        handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("ghost")))
 
         self.assertEqual(handoffs, [])
         self.assertEqual(recorder.calls, [])
@@ -246,7 +295,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         catalog = _Catalog(sku1=_Record(in_stock=False))
         checkout = self._checkout(recorder, catalog=catalog)
 
-        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
         self.assertEqual(recorder.calls, [])
@@ -264,7 +313,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     recorder, catalog=_Catalog(sku1=record)
                 )
 
-                handoffs = await checkout.checkout_handoff(
+                handoffs = await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line("sku1"))
                 )
 
@@ -283,7 +333,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_DictCatalog())
 
         with self.assertLogs(checkout_module.logger, level="WARNING") as logged:
-            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
         self.assertEqual(recorder.calls, [])
@@ -295,7 +345,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         cart = SimpleNamespace(items=[_Line("sku1")])  # no `currency` at all
 
         with self.assertLogs(checkout_module.logger, level="WARNING") as logged:
-            handoffs = await checkout.checkout_handoff(_Session(), cart)
+            handoffs = await self._handoff(checkout, _Session(), cart)
 
         self.assertEqual(handoffs, [])
         self.assertTrue(any("missing_cart_currency" in line for line in logged.output))
@@ -305,7 +355,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         catalog = _Catalog(sku1=_Record(price=10.0), sku2=_Record(price=20.5))
         checkout = self._checkout(recorder, catalog=catalog)
 
-        await checkout.checkout_handoff(
+        await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku1", price=10.0, quantity=2), _Line("sku2", price=20.5)),
         )
@@ -323,7 +374,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertNotIn("currency_id", recorder.body["items"][0])
 
@@ -339,13 +390,15 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 "currency": "ARS",
                 "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
+                "external_reference": body["external_reference"],
             }
         )
         checkout = self._checkout(
             recorder, catalog=_Catalog(sku1=_Record(currency="ARS"))
         )
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1"), currency="ARS")
         )
 
@@ -362,7 +415,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             catalog=_Catalog(sku1=_Record(currency="BRL"), sku2=_Record(currency="ARS")),
         )
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1"), _Line("sku2"))
         )
 
@@ -382,22 +436,27 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     recorder, catalog=_Catalog(sku1=record)
                 )
 
-                handoffs = await checkout.checkout_handoff(_Session(), cart)
+                handoffs = await self._handoff(checkout, _Session(), cart)
 
                 self.assertEqual(handoffs, [])
                 self.assertEqual(recorder.calls, [])
 
     # -- the High finding: the caller's session id must stay out of the payment ----
 
-    async def test_omits_external_reference_by_default(self):
+    async def test_sends_the_seller_reference_without_deriving_it_from_session(self):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
         session = _Session("session-from-a-raw-header")
 
-        handoffs = await checkout.checkout_handoff(session, _Cart(_Line("sku1")))
+        handoffs = await self._handoff(
+            checkout,
+            session,
+            _Cart(_Line("sku1")),
+            external_reference="seller-order-safe",
+        )
 
         self.assertEqual(len(handoffs), 1)
-        self.assertNotIn("external_reference", recorder.body)
+        self.assertEqual(recorder.body["external_reference"], "seller-order-safe")
         self.assertNotIn(session.session_id, json.dumps(recorder.body))
 
     # -- the remaining hardening --------------------------------------------------
@@ -423,7 +482,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Mutating())
 
-        await checkout.checkout_handoff(_Session(), cart)
+        await self._handoff(checkout, _Session(), cart)
 
         self.assertEqual(len(recorder.body["items"]), 1)
         self.assertEqual(recorder.body["items"][0]["quantity"], 1)
@@ -442,7 +501,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Growing())
 
         await asyncio.wait_for(
-            checkout.checkout_handoff(_Session(), cart), timeout=5
+            self._handoff(checkout, _Session(), cart), timeout=5
         )
 
         self.assertEqual(len(recorder.body["items"]), 1)
@@ -452,7 +511,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(*[_Line("sku1", quantity=10) for _ in range(20)])
         )
 
@@ -470,12 +530,14 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        await checkout.checkout_handoff(
+        await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku_a"), _Line("sku_b")),
             idempotency_key="same-operation",
         )
-        await checkout.checkout_handoff(
+        await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku_b"), _Line("sku_a")),
             idempotency_key="same-operation",
@@ -501,7 +563,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        await checkout.checkout_handoff(
+        await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1")), idempotency_key="this-call"
         )
 
@@ -515,7 +578,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1")), idempotency_key="k" * 65
         )
 
@@ -547,6 +611,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     "currency": "BRL",
                     "expiration_time": "P1D",
                     "total_amount": body["total_amount"],
+                    "external_reference": body["external_reference"],
                 },
             }
 
@@ -555,7 +620,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         sdk.order.return_value.create = create
         checkout = MercadoPagoCheckout(sdk=sdk, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1")), idempotency_key="op-1"
         )
 
@@ -563,7 +629,9 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual({key for _, key in attempts}, {"op-1"})
         self.assertEqual(attempts[0][0], attempts[1][0])
-        self.assertNotIn("external_reference", json.loads(attempts[0][0]))
+        self.assertEqual(
+            json.loads(attempts[0][0])["external_reference"], EXTERNAL_REFERENCE
+        )
 
     async def test_two_transport_failures_raise_an_indeterminate_outcome(self):
         effects = []
@@ -586,14 +654,15 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
             with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-                await checkout.checkout_handoff(
+                await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line("sku1")), idempotency_key="op-1"
                 )
 
         self.assertEqual(len(effects), 2)
         self.assertEqual(effects[0], effects[1])
         self.assertEqual(captured.exception.idempotency_key, "op-1")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertEqual(captured.exception.reason, "transport_failure")
         self.assertIsNone(captured.exception.order_id)
         self.assertFalse(any("op-1" in line for line in logged.output))
@@ -616,7 +685,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = MercadoPagoCheckout(sdk=sdk, catalog=_Catalog(sku1=_Record()))
 
         with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-            await checkout.checkout_handoff(
+            await self._handoff(
+                checkout,
                 _Session(),
                 _Cart(_Line("sku1")),
                 idempotency_key="op-lost-response",
@@ -636,7 +706,6 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         keys = []
 
         def create(body, request_options=None):
-            del body
             keys.append(request_options.get_headers()["x-idempotency-key"])
             if len(keys) == 1:
                 started.set()
@@ -653,6 +722,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     "currency": "BRL",
                     "expiration_time": "P1D",
                     "total_amount": "100.00",
+                    "external_reference": body["external_reference"],
                 },
             }
 
@@ -662,7 +732,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = MercadoPagoCheckout(sdk=sdk, catalog=_Catalog(sku1=_Record()))
 
         task = asyncio.create_task(
-            checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
         )
         self.assertTrue(await asyncio.to_thread(started.wait, 5))
         task.cancel()
@@ -671,14 +741,15 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         release.set()
         self.assertTrue(await asyncio.to_thread(finished.wait, 5))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku1")),
             idempotency_key=captured.exception.idempotency_key,
         )
 
         self.assertEqual(captured.exception.reason, "create_interrupted")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertIsNone(captured.exception.order_id)
         self.assertEqual(len(handoffs), 1)
         self.assertEqual(len(keys), 2)
@@ -690,7 +761,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record(price="1E+93")))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1", price="1E+93", quantity=10))
         )
 
@@ -713,10 +785,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         sdk = mock.MagicMock()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
 
-        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
-        self.assertNotIn("external_reference", recorder.body)
+        self.assertEqual(recorder.body["external_reference"], EXTERNAL_REFERENCE)
         sdk.order.return_value.cancel.assert_called_once()
         order_id, options = sdk.order.return_value.cancel.call_args.args
         self.assertEqual(order_id, "ORD-1")
@@ -744,10 +816,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         sdk = mock.MagicMock()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
 
-        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
-        self.assertNotIn("external_reference", recorder.body)
+        self.assertEqual(recorder.body["external_reference"], EXTERNAL_REFERENCE)
         sdk.order.return_value.cancel.assert_called_once()
         order_id, options = sdk.order.return_value.cancel.call_args.args
         self.assertEqual(order_id, "ORD-1")
@@ -767,10 +839,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
             with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-                await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+                await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(captured.exception.reason, "cleanup_not_confirmed")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertEqual(captured.exception.order_id, "ORD-1")
         self.assertTrue(any("409" in line for line in logged.output))
 
@@ -784,7 +856,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
 
         with self.assertLogs(checkout_module.logger, level="INFO") as logged:
-            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
         self.assertTrue(any("Cancelled a refused order" in line for line in logged.output))
@@ -800,7 +872,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
             with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-                await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+                await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(captured.exception.order_id, "ORD-1")
         self.assertFalse(any("forged-log-entry" in line for line in logged.output))
@@ -824,10 +896,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-                    await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+                    await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
                 self.assertEqual(captured.exception.reason, "cleanup_not_confirmed")
-                self.assertIsNone(captured.exception.external_reference)
+                self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
                 self.assertEqual(captured.exception.order_id, "ORD-1")
 
     async def test_does_not_cancel_an_order_it_hands_over(self):
@@ -835,7 +907,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         sdk = mock.MagicMock()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
 
-        handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(len(handoffs), 1)
         sdk.order.return_value.cancel.assert_not_called()
@@ -849,10 +921,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs(checkout_module.logger, level="ERROR") as logged:
             with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-                await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+                await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(captured.exception.reason, "cleanup_not_confirmed")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertEqual(captured.exception.order_id, "ORD-1")
         # Neither the payment identifier nor the SDK's own exception text — which can
         # carry request URLs — belongs in logs.
@@ -879,7 +951,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
         sdk.order.return_value.cancel = cancel
         task = asyncio.create_task(
-            checkout.checkout_handoff(
+            self._handoff(
+                checkout,
                 _Session(),
                 _Cart(_Line("sku1")),
                 idempotency_key="operation-1",
@@ -895,7 +968,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured.exception.reason, "cleanup_interrupted")
         self.assertEqual(captured.exception.idempotency_key, "operation-1")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertEqual(captured.exception.order_id, "ORD-1")
 
     async def test_an_unreadable_order_id_blocks_the_fallback(self):
@@ -904,10 +977,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
 
         with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-            await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(captured.exception.reason, "cleanup_not_confirmed")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertIsNone(captured.exception.order_id)
         sdk.order.return_value.cancel.assert_not_called()
 
@@ -917,7 +990,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         for cart in (object(), SimpleNamespace(currency="BRL")):
             with self.subTest(cart=cart):
-                self.assertEqual(await checkout.checkout_handoff(_Session(), cart), [])
+                self.assertEqual(await self._handoff(checkout, _Session(), cart), [])
                 self.assertEqual(recorder.calls, [])
 
     async def test_rejects_a_checkout_url_outside_mercadopago(self):
@@ -929,7 +1002,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
         with self.assertLogs(checkout_module.logger, "ERROR"):
-            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
 
@@ -943,7 +1016,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
         with self.assertLogs(checkout_module.logger, "ERROR"):
-            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertEqual(handoffs, [])
 
@@ -965,7 +1038,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 with self.assertLogs(checkout_module.logger, "ERROR"):
-                    handoffs = await checkout.checkout_handoff(
+                    handoffs = await self._handoff(
+                        checkout,
                         _Session(), _Cart(_Line("sku1"))
                     )
 
@@ -987,8 +1061,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     "expiration_time": "P1D",
                     "total_amount": body["total_amount"],
                 }
-                if "external_reference" in body:
-                    payload["external_reference"] = body["external_reference"]
+                payload["external_reference"] = body["external_reference"]
                 payload.update(overrides)
                 return payload
 
@@ -1008,7 +1081,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 with self.assertLogs(checkout_module.logger, "ERROR"):
-                    handoffs = await checkout.checkout_handoff(
+                    handoffs = await self._handoff(
+                        checkout,
                         _Session(), _Cart(_Line("sku1"))
                     )
 
@@ -1017,7 +1091,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder(response=response_with(external_reference="another-reference"))
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
         with self.assertLogs(checkout_module.logger, "ERROR"):
-            handoffs = await checkout.checkout_handoff(
+            handoffs = await self._handoff(
+                checkout,
                 _Session(),
                 _Cart(_Line("sku1")),
                 external_reference="expected-reference",
@@ -1038,7 +1113,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         )
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
         with self.assertLogs(checkout_module.logger, "ERROR"):
-            handoffs = await checkout.checkout_handoff(
+            handoffs = await self._handoff(
+                checkout,
                 _Session(),
                 _Cart(_Line("sku1")),
                 external_reference="expected-reference",
@@ -1050,19 +1126,23 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             recorder, catalog=_Catalog(sku1=_Record())
         )
         with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-            await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
         self.assertEqual(captured.exception.reason, "cleanup_not_confirmed")
-        self.assertIsNone(captured.exception.external_reference)
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
         self.assertIsNone(captured.exception.order_id)
 
-    async def test_reuses_a_caller_supplied_idempotency_key_verbatim(self):
-        """The same operation retried carries the same key and the same body."""
+    async def test_reuses_a_caller_supplied_attempt_pair_verbatim(self):
+        """The same operation retried carries the same pair and the same body."""
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
         for _ in range(2):
-            await checkout.checkout_handoff(
-                _Session(), _Cart(_Line("sku1")), idempotency_key="op-42"
+            await self._handoff(
+                checkout,
+                _Session(),
+                _Cart(_Line("sku1")),
+                external_reference="seller-order-42",
+                idempotency_key="op-42",
             )
 
         first, second = recorder.calls
@@ -1072,21 +1152,10 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             second[1].get_headers()["x-idempotency-key"], "op-42"
         )
+        self.assertEqual(first[0]["external_reference"], "seller-order-42")
+        self.assertEqual(second[0]["external_reference"], "seller-order-42")
         # A reused key must carry a byte-identical body, which Orders requires.
         self.assertEqual(first[0], second[0])
-
-    async def test_generates_a_uuid4_key_when_the_caller_omits_one(self):
-        recorder = _Recorder()
-        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
-
-        for _ in range(2):
-            await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
-
-        keys = [call[1].get_headers()["x-idempotency-key"] for call in recorder.calls]
-        for key in keys:
-            self.assertEqual(UUID(key).version, 4)
-        # A separate call is a separate purchase, so it must not reuse the key.
-        self.assertNotEqual(keys[0], keys[1])
 
     async def test_an_invalid_key_fails_closed_without_minting_another(self):
         """Silently replacing a rejected key would create a second payable order."""
@@ -1095,14 +1164,15 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 recorder = _Recorder()
                 checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-                handoffs = await checkout.checkout_handoff(
+                handoffs = await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line("sku1")), idempotency_key=key
                 )
 
                 self.assertEqual(handoffs, [])
                 self.assertEqual(recorder.calls, [])
 
-    async def test_response_reference_is_ignored_when_none_was_requested(self):
+    async def test_refuses_a_response_with_a_different_external_reference(self):
         recorder = _Recorder()
         recorder.response = lambda body: {
             "id": "ORD-1",
@@ -1117,20 +1187,23 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         }
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(session_id="session-from-a-raw-header"),
             _Cart(_Line("sku1")),
+            external_reference="expected-reference",
             idempotency_key="op-42",
         )
 
-        self.assertEqual(len(handoffs), 1)
-        self.assertNotIn("external_reference", recorder.body)
+        self.assertEqual(handoffs, [])
+        self.assertEqual(recorder.body["external_reference"], "expected-reference")
 
     async def test_uses_a_seller_supplied_external_reference_verbatim(self):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku1")),
             idempotency_key="opaque-operation-key",
@@ -1146,7 +1219,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 recorder = _Recorder()
                 checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-                handoffs = await checkout.checkout_handoff(
+                handoffs = await self._handoff(
+                    checkout,
                     _Session(),
                     _Cart(_Line("sku1")),
                     idempotency_key="operation-1",
@@ -1171,7 +1245,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             request_options=sdk_options,
         )
 
-        await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         sent_options = recorder.calls[-1][1]
         self.assertIsNot(sent_options, sdk_options)
@@ -1189,7 +1263,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk
         )
 
-        await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         sdk.order.assert_called_once_with()
         sdk.preference.assert_not_called()
@@ -1216,7 +1290,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             catalog=_Catalog(sku1=_Record()),
         )
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku1")),
             idempotency_key="floor-create-key",
@@ -1228,7 +1303,9 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         create, cancel = http.calls
         self.assertEqual(create["url"], "https://api.mercadopago.com/v1/orders")
         self.assertEqual(create["headers"]["x-idempotency-key"], "floor-create-key")
-        self.assertNotIn("external_reference", json.loads(create["data"]))
+        self.assertEqual(
+            json.loads(create["data"])["external_reference"], EXTERNAL_REFERENCE
+        )
         self.assertEqual(
             cancel["url"],
             "https://api.mercadopago.com/v1/orders/ORD-FLOOR/cancel",
@@ -1242,13 +1319,14 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             cancel["headers"]["x-idempotency-key"],
         )
 
-    async def test_minimum_sdk_real_order_resource_preserves_optional_reference(self):
-        """The supported SDK must put an opted-in seller reference on the wire."""
+    async def test_minimum_sdk_real_order_resource_preserves_required_reference(self):
+        """The supported SDK must put the seller reference on the wire unchanged."""
         http = _FakeHttpClient()
         sdk = mercadopago.SDK(TOKEN, http_client=http)
         checkout = MercadoPagoCheckout(sdk=sdk, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(),
             _Cart(_Line("sku1")),
             external_reference="seller-order-42",
@@ -1265,7 +1343,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(_Line("sku1"))
         )
 
@@ -1279,7 +1358,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
-        await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         # Literal on purpose: comparing against the constant would let an accidental
         # edit change production and test together.
@@ -1296,7 +1375,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             recorder, catalog=_Catalog(sku1=_Record())
         )
 
-        await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+        await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         self.assertNotIn("application_id", recorder.body["integration_data"])
         self.assertNotIn("sponsor", recorder.body["integration_data"])
@@ -1315,7 +1394,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
         with self.assertLogs(checkout_module.logger, "ERROR") as captured:
-            handoffs = await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         logged = "\n".join(captured.output)
         self.assertEqual(handoffs, [])
@@ -1332,7 +1411,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     recorder, catalog=_Catalog(sku1=_Record())
                 )
 
-                handoffs = await checkout.checkout_handoff(
+                handoffs = await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line("sku1", quantity=quantity))
                 )
 
@@ -1351,7 +1431,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             side_effect=AssertionError("integer conversion must not run"),
             create=True,
         ):
-            handoffs = await checkout.checkout_handoff(
+            handoffs = await self._handoff(
+                checkout,
                 _Session(), _Cart(_Line("sku1", quantity="1E+300000"))
             )
 
@@ -1362,7 +1443,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog())
 
-        handoffs = await checkout.checkout_handoff(
+        handoffs = await self._handoff(
+            checkout,
             _Session(), _Cart(*[_Line(f"sku-{index}") for index in range(21)])
         )
 
@@ -1377,7 +1459,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                     recorder, catalog=_Catalog(sku1=_Record(price=price))
                 )
 
-                handoffs = await checkout.checkout_handoff(
+                handoffs = await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line("sku1"))
                 )
 
@@ -1390,7 +1473,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         for product_id in ("", "x" * 257, "with\ncontrol", None):
             with self.subTest(product_id=product_id):
-                handoffs = await checkout.checkout_handoff(
+                handoffs = await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line(product_id))
                 )
 
@@ -1415,7 +1499,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 )
                 with self.assertLogs(checkout_module.logger, "ERROR") as captured:
                     with self.assertRaises(CheckoutOutcomeUnknown) as outcome:
-                        await checkout.checkout_handoff(
+                        await self._handoff(
+                            checkout,
                             _Session(), _Cart(_Line("sku1"))
                         )
                 self.assertEqual(outcome.exception.reason, "invalid_sdk_response")
@@ -1432,7 +1517,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertLogs(checkout_module.logger, "ERROR") as captured:
             with self.assertRaises(CheckoutOutcomeUnknown) as outcome:
-                await checkout.checkout_handoff(
+                await self._handoff(
+                    checkout,
                     _Session(), _Cart(_Line("sku1"))
                 )
         self.assertEqual(outcome.exception.reason, "sdk_failure")
@@ -1446,7 +1532,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
         with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-            await checkout.checkout_handoff(
+            await self._handoff(
+                checkout,
                 _Session(), _Cart(_Line("sku1")), idempotency_key="existing-attempt"
             )
 
@@ -1462,7 +1549,8 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 with self.assertRaises(CheckoutOutcomeUnknown) as captured:
-                    await checkout.checkout_handoff(
+                    await self._handoff(
+                        checkout,
                         _Session(), _Cart(_Line("sku1")), idempotency_key="operation-1"
                     )
 
@@ -1480,7 +1568,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
         with self.assertLogs(checkout_module.logger, "ERROR") as captured:
-            await checkout.checkout_handoff(_Session(), _Cart(_Line("sku1")))
+            await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
 
         logged = "\n".join(captured.output)
         self.assertNotIn("forged log line", logged)
@@ -1499,7 +1587,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         recorder = _Recorder()
         checkout = self._checkout(recorder, catalog=_Catalog())
 
-        self.assertEqual(await checkout.checkout_handoff(_Session(), _Cart()), [])
+        self.assertEqual(await self._handoff(checkout, _Session(), _Cart()), [])
         self.assertEqual(recorder.calls, [])
 
     def test_access_token_is_not_in_the_repr(self):
@@ -1532,14 +1620,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(sensitive, str(error))
             self.assertNotIn(sensitive, repr(error))
 
-    def test_indeterminate_exception_accepts_an_omitted_external_reference(self):
-        error = CheckoutOutcomeUnknown(
-            idempotency_key="private-host-operation-id",
-            reason="transport_failure",
-        )
-
-        self.assertIsNone(error.external_reference)
-        self.assertIsNone(error.order_id)
+    def test_indeterminate_exception_requires_an_external_reference(self):
+        with self.assertRaises(TypeError):
+            CheckoutOutcomeUnknown(
+                idempotency_key="private-host-operation-id",
+                reason="transport_failure",
+            )
 
 
 class HandoffTypeTest(unittest.TestCase):

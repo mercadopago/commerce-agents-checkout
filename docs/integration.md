@@ -2,10 +2,12 @@
 
 ## Boundary
 
-`MercadoPagoCheckout` implements only the payment handoff expected by
-`StorefrontBackend.checkout_handoff(session, cart)`. The agent chooses products and
-quantities; the seller backend remains authoritative for identity, cart ownership,
-catalog data, price, currency, stock, and whether checkout is allowed.
+`MercadoPagoCheckout` is the payment adapter called by a seller's
+`StorefrontBackend.checkout_handoff(session, cart)`. commerce-agents calls that backend
+method with exactly two arguments; the backend obtains the persisted attempt identifiers
+and passes them to this adapter. The agent chooses products and quantities; the seller
+backend remains authoritative for identity, cart ownership, catalog data, price, currency,
+stock, and whether checkout is allowed.
 
 The adapter never receives card data and never gives payment authority to the model.
 It creates a Mercado Pago Checkout Pro order server-side and returns a hosted URL after
@@ -19,14 +21,14 @@ checkout_handoff(
     session,
     cart,
     *,
-    idempotency_key: str | None = None,
-    external_reference: str | None = None,
+    external_reference: str,
+    idempotency_key: str,
 )
 CheckoutOutcomeUnknown(
     *,
+    external_reference: str,
     idempotency_key: str,
     reason: str,
-    external_reference: str | None = None,
     order_id: str | None = None,
 )
 ```
@@ -36,22 +38,26 @@ CheckoutOutcomeUnknown(
   `title`, `price`, `currency`, and `in_stock is True`.
 - The currency is derived from those records, not configured. Every record must agree
   with the others and with the cart, and the created Order is checked against it.
-- `idempotency_key` scopes one operation. Omitted, a UUID v4 covers this call and its
-  internal retries. Supplied, it is validated and used verbatim; an invalid value fails
-  closed instead of being replaced. Reusing a key with a different payload is answered by
-  Mercado Pago with `HTTP 409 idempotency_key_already_used`.
-- A supplied key is limited to 64 characters by the supported SDK. Product and Order
+- `idempotency_key` scopes one operation. It is required, validated, and used verbatim; an
+  invalid value fails closed instead of being replaced. Reusing a key with a different
+  payload is answered by Mercado Pago with `HTTP 409 idempotency_key_already_used`.
+- The key is limited to 64 characters by the supported SDK. Product and Order
   identifiers have their own 256-character validation boundary.
-- `external_reference` is an optional seller business identifier and may be an ecommerce
-  Order number; it does not need to be a UUID. A supplied value accepts 1–64 letters,
-  digits, hyphens and underscores. When omitted, the adapter omits the field from the
-  request. It must not contain shopper PII or a session ID.
+- `external_reference` is a required seller business identifier and may be an ecommerce
+  Order number; it does not need to be a UUID. It accepts 1–64 letters, digits, hyphens and
+  underscores. It must not contain shopper PII or a session ID.
 
 The adapter does not own authentication, secrets management, persistence, reconciliation
-or webhook delivery, and exposes no callbacks for them. Production hosts must persist the
-operation key before calling. The normal production path also passes, stores, and indexes
-the host's own Order reference; omit it only when the host has another authoritative
-Order-to-attempt mapping maintained outside this adapter.
+or webhook delivery, and exposes no callbacks for them. Production hosts must create and
+persist the operation key and seller Order reference atomically before calling, then reuse
+that same pair for every retry of the confirmed purchase.
+
+This requirement is intentionally stricter than the published Orders API reference and
+the supported Python SDK, which currently describe `external_reference` as optional. An
+opt-in live Checkout Pro Orders request made during integration validation without the
+field returned HTTP 400 with `required_properties` and identified `external_reference` as
+missing. This records the behavior of the tested path, not a claim that every Orders
+product or account rejects omission.
 
 ## Orders API request
 
@@ -69,6 +75,7 @@ The relevant payload shape is:
   "processing_mode": "manual",
   "total_amount": "40.50",
   "expiration_time": "P1D",
+  "external_reference": "seller-order-1234",
   "integration_data": {
     "platform_id": "dev_9e28fa65abb111f189e77e2ccf36aeec"
   },
@@ -82,9 +89,8 @@ The relevant payload shape is:
 }
 ```
 
-When the seller passes `external_reference="seller-order-1234"`, the adapter adds exactly
-`"external_reference": "seller-order-1234"` to that payload. It does not add the field
-otherwise.
+The adapter always adds the required `external_reference` exactly as validated; it never
+derives it from the idempotency key, session, or shopper data.
 
 An item carries `title`, `quantity`, and `unit_price` only. Orders validates items with
 `additionalProperties: false`, so a per-item `total_amount` or `unit_measure` is
@@ -94,8 +100,7 @@ rejected with HTTP 400; the order-level `total_amount` is what covers the quanti
 
 The package always sends its registered `platform_id` in `integration_data`; hosts do not
 configure attribution. It does not send other attribution fields. A retry must reuse the
-same idempotency key and the same payload, including the seller's `external_reference`
-when one was supplied.
+same idempotency key, external reference, and payload.
 
 The package intentionally omits:
 
@@ -109,10 +114,10 @@ The package intentionally omits:
 ## Orders API response
 
 Mercado Pago returns an order `id` and `checkout_url`. The adapter first verifies the
-expected `online` type, `manual` processing mode, `created` initial status, amount, and
-currency. It also compares `external_reference` when the seller supplied one. It accepts
-the URL only when it uses HTTPS, has no embedded credentials, uses port 443 or the default
-HTTPS port, and matches an explicit Mercado Pago hostname.
+expected `online` type, `manual` processing mode, `created` initial status, amount,
+currency, and required `external_reference`. It accepts the URL only when it uses HTTPS,
+has no embedded credentials, uses port 443 or the default HTTPS port, and matches an
+explicit Mercado Pago hostname.
 
 The accepted URL becomes:
 
@@ -133,8 +138,7 @@ The adapter's public success result is the returned `checkout_url`; it does not 
 Order ID separately or ask hosts to parse one from that URL. On Mercado Pago's side, the
 Order ID remains the resource for status lookup, cancellation, refunds, and webhooks.
 This flow never calls the Preferences API. Production hosts should persist the
-idempotency key and expected Order snapshot before calling, plus their
-`external_reference` when they choose to send one.
+idempotency key, external reference, and expected Order snapshot before calling.
 
 ## Failure behavior
 
@@ -147,10 +151,9 @@ After a POST may have reached Mercado Pago, fallback is allowed only when the re
 proven or a refused Order is confirmed canceled. Otherwise the method raises
 `CheckoutOutcomeUnknown`, including when a retry receives a client error after the first
 response was lost. The exception exposes the operation key and reference for controlled
-reconciliation; the reference attribute is `None` when the seller did not supply one. Its
-`order_id` attribute is populated only when a failed cleanup had already identified the
-Order. Its message and adapter logs expose none of those identifiers; do not convert it
-to `[]`.
+reconciliation. Its `order_id` attribute is populated only when a failed cleanup had
+already identified the Order. Its message and adapter logs expose none of those
+identifiers; do not convert it to `[]`.
 
 API error codes and SDK behavior can evolve. Use the sanitized logger fields to locate a
 failure, then confirm its current meaning in the
@@ -193,12 +196,10 @@ It does not mean the buyer paid.
 The host must validate the Order webhook signature using Mercado Pago's
 [Webhooks guide](https://www.mercadopago.com/developers/en/docs/your-integrations/notifications/webhooks),
 deduplicate the event, and associate its Order with exactly one persisted checkout
-attempt before changing local state. Supplying and storing `external_reference` is the
-normal production correlation path; omit it only when the host already persists an
-independent Mercado Pago Order-ID-to-attempt mapping outside this adapter. After that
-association, fetch `/v1/orders/{id}`, verify the expected amount and currency, and apply
-a valid local state transition. Amount, currency, browser redirects, and query parameters
-are never correlation keys or payment evidence.
+attempt before changing local state. Match its required `external_reference` to that
+attempt, fetch `/v1/orders/{id}`, verify the expected amount and currency, and apply a valid
+local state transition. Amount, currency, browser redirects, and query parameters are
+never correlation keys or payment evidence.
 
 What the seller configures on the Mercado Pago side — credentials, the Order webhook,
 test users — is listed with links in the README under "What the seller configures".

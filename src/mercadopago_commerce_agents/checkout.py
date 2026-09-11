@@ -21,7 +21,14 @@ method with a real Checkout Pro order through ``POST /v1/orders``::
             self.mercadopago = MercadoPagoCheckout(sdk=sdk, catalog=self)
 
         async def checkout_handoff(self, session, cart):
-            return await self.mercadopago.checkout_handoff(session, cart)
+            # Persist this pair before the first API call and load it on every retry.
+            attempt = await self.checkout_attempts.get_or_create(session, cart)
+            return await self.mercadopago.checkout_handoff(
+                session,
+                cart,
+                external_reference=attempt.external_reference,
+                idempotency_key=attempt.idempotency_key,
+            )
 
 Why ``catalog`` is required
 ---------------------------
@@ -45,10 +52,10 @@ confirmed aborts the handoff.
 What this class does not fix
 ---------------------------
 It cannot authenticate the shopper — only the host can. It never derives payment fields
-from the caller-supplied session id: ``external_reference`` is omitted unless the seller
-explicitly supplies its own business identifier. A deployment that leaves
-``X-Session-Id`` unauthenticated still has an unauthenticated cart. Authenticate the
-session in the host before wiring this in.
+from the caller-supplied session id: the seller must provide its own persisted
+``external_reference`` and idempotency key. A deployment that leaves ``X-Session-Id``
+unauthenticated still has an unauthenticated cart. Authenticate the session in the host
+before wiring this in.
 """
 
 from __future__ import annotations
@@ -61,7 +68,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 from urllib.parse import urlsplit
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, uuid5
 
 import mercadopago
 import requests
@@ -149,21 +156,20 @@ class CheckoutOutcomeUnknown(RuntimeError):
 
     Returning the host's fallback checkout in this state could leave two payable
     checkouts for one purchase. The host must stop that fallback and reuse
-    ``idempotency_key`` if it retries. When the seller supplied an
-    ``external_reference``, it is also available for reconciliation.
+    the same ``idempotency_key`` and ``external_reference`` if it retries. Both
+    identifiers are available for reconciliation.
 
-    The exception text contains no recovery identifier. The key, optional seller
-    reference, and an Order ID when cleanup had already identified one remain available
-    as attributes for controlled recovery without leaking into an ordinary exception
-    log.
+    The exception text contains no recovery identifier. The key, seller reference, and
+    an Order ID when cleanup had already identified one remain available as attributes
+    for controlled recovery without leaking into an ordinary exception log.
     """
 
     def __init__(
         self,
         *,
+        external_reference: str,
         idempotency_key: str,
         reason: str,
-        external_reference: str | None = None,
         order_id: str | None = None,
     ):
         self.idempotency_key = idempotency_key
@@ -263,47 +269,42 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         session: "ShoppingSessionContext",
         cart: "Cart",
         *,
-        idempotency_key: str | None = None,
-        external_reference: str | None = None,
+        external_reference: str,
+        idempotency_key: str,
     ) -> list[CheckoutHandoff]:
-        """Drop-in for ``StorefrontBackend.checkout_handoff``.
+        """Create a handoff for a seller backend's two-argument wrapper.
 
         The many early returns are the design: every branch that is not an order we
         are confident in leaves through one of them.
 
-        ``idempotency_key`` identifies one checkout operation. Left unset, a UUID v4 is
-        generated for this call and its internal retries. Supplied, it is validated and
-        used exactly as given — never replaced by a fresh one, because silently minting
-        another key would turn a rejected duplicate into a second payable order. Reusing
-        a key with a different payload is refused by Mercado Pago with HTTP 409, so a new
-        purchase needs a new key; idempotency across processes or restarts means the
-        backend supplying the same key again.
+        ``idempotency_key`` identifies one checkout operation and is used exactly as
+        supplied — never replaced by a fresh one, because silently minting another key
+        would turn a rejected duplicate into a second payable order. Reusing a key with
+        a different payload is refused by Mercado Pago with HTTP 409, so a new purchase
+        needs a new key. The seller backend must persist it before the first call and
+        supply the same value across retries and process restarts.
 
-        ``external_reference`` is an optional seller business identifier for the Order.
-        It may be an ecommerce order number and does not need to be a UUID. When omitted,
-        the field is omitted from the request. Mercado Pago accepts up to 64 letters,
-        digits, hyphens and underscores; invalid supplied values fail closed before any
-        API call.
+        ``external_reference`` is the seller business identifier required by this
+        Checkout Pro Orders flow. It may be an ecommerce order number and does not need
+        to be a UUID. The backend must persist it with the idempotency key. The adapter
+        accepts up to 64 letters, digits, hyphens and underscores; invalid values fail
+        closed before any catalog lookup or API call.
 
         Returns an empty list — letting the host's own checkout card take over — only
         when no order was created or when a refused order was confirmed cancelled.
         Raises :class:`CheckoutOutcomeUnknown` after any POST whose outcome cannot be
         proven, because falling back in that state could expose two payable checkouts.
         """
-        snapshot = _snapshot(cart)
-        if snapshot is None or not snapshot.lines:
-            return []
-        if idempotency_key is None:
-            idempotency_key = str(uuid4())
-        elif not _valid_idempotency_key(idempotency_key):
+        if not _valid_idempotency_key(idempotency_key):
             # Fail closed: generating a replacement here would create an order the
             # caller believes it already deduplicated.
             logger.warning("Refusing to create an order: invalid_idempotency_key")
             return []
-        if external_reference is not None and not _valid_external_reference(
-            external_reference
-        ):
+        if not _valid_external_reference(external_reference):
             logger.warning("Refusing to create an order: invalid_external_reference")
+            return []
+        snapshot = _snapshot(cart)
+        if snapshot is None or not snapshot.lines:
             return []
 
         try:
@@ -330,9 +331,8 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # has moved on.
             "expiration_time": _ORDER_EXPIRATION,
             "integration_data": {"platform_id": _PLATFORM_ID},
+            "external_reference": external_reference,
         }
-        if external_reference is not None:
-            body["external_reference"] = external_reference
 
         order = await self._create(body, idempotency_key, external_reference)
         if order is None:
@@ -456,7 +456,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
     def _validated_url(
         self,
         order: dict[str, Any],
-        external_reference: str | None,
+        external_reference: str,
         total_amount: str,
         currency: str,
     ) -> str | None:
@@ -479,10 +479,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # so an order that came back without it is not the order we asked for.
             order.get("expiration_time"),
         )
-        reference_matches = (
-            external_reference is None
-            or order.get("external_reference") == external_reference
-        )
+        reference_matches = order.get("external_reference") == external_reference
         if (
             returned_state != expected_state
             or not reference_matches
@@ -493,7 +490,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         return checkout_url
 
     async def _cancel(
-        self, order_id: Any, idempotency_key: str, external_reference: str | None
+        self, order_id: Any, idempotency_key: str, external_reference: str
     ) -> bool:
         """Cancel a refused order and return whether the API confirmed the cleanup.
 
@@ -550,7 +547,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         self,
         body: dict[str, Any],
         idempotency_key: str,
-        external_reference: str | None,
+        external_reference: str,
     ) -> dict[str, Any] | None:
         """The API call. Uses the official SDK, which also means the base URL is not
         configurable here — it is a private constant in ``mercadopago.config.Config`` —
@@ -651,7 +648,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         body: dict[str, Any],
         options: Any,
         idempotency_key: str,
-        external_reference: str | None,
+        external_reference: str,
     ) -> Any:
         """One attempt. ``_UNREACHABLE`` marks a transport failure, which may still have
         reached Mercado Pago and is therefore safe to replay with the same key."""
@@ -702,7 +699,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
     @staticmethod
     def _raise_outcome_unknown(
         idempotency_key: str,
-        external_reference: str | None,
+        external_reference: str,
         reason: str,
         *,
         order_id: str | None = None,
@@ -789,7 +786,7 @@ def _valid_identifier(value: Any) -> bool:
 
 
 def _valid_external_reference(value: Any) -> bool:
-    """Apply the Orders API's documented business-reference contract locally."""
+    """Apply the adapter's bounded, opaque seller-reference contract locally."""
     return isinstance(value, str) and _EXTERNAL_REFERENCE.fullmatch(value) is not None
 
 

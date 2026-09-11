@@ -1,10 +1,11 @@
 # Copyright 2026 Mercado Pago
 # SPDX-License-Identifier: Apache-2.0
 
-"""Mercado Pago as a drop-in payment provider for commerce-agents.
+"""Mercado Pago Checkout Pro integration for commerce-agents seller backends.
 
-``MercadoPagoCheckout`` fills ``StorefrontBackend.checkout_handoff``; see its docstring
-for the wiring and for why it needs your catalog.
+``MercadoPagoCheckout`` is called by a ``StorefrontBackend.checkout_handoff`` wrapper
+that owns the durable checkout-attempt identifiers; see its docstring for the wiring and
+for why it needs your catalog.
 """
 
 from .checkout import (

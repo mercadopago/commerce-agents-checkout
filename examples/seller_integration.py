@@ -15,9 +15,9 @@ test seller. It creates one order for the cart below but redacts its checkout UR
 identifiers by default. The explicit output flag works only in an interactive terminal.
 The order expires after 24 hours and nothing is charged until someone pays it.
 
-Unlike the README's minimal handoff, this advanced example opts into a seller-owned
-``external_reference`` so its webhook can map the Mercado Pago Order back to one exact
-persisted checkout attempt.
+The seller-owned ``external_reference`` and idempotency key are created and persisted as
+one checkout attempt before the API call. That lets retries reuse the exact operation
+and lets a webhook map the Mercado Pago Order back to one seller purchase.
 
 The cart and session types are defined here on purpose. In a real deployment they are
 commerce-agents' own ``Cart`` and ``ShoppingSessionContext``, and this package never
@@ -38,11 +38,12 @@ import mercadopago
 
 from mercadopago_commerce_agents import (
     CheckoutHandoff,
+    CheckoutOutcomeUnknown,
     MercadoPagoCheckout,
 )
 
-_ATTEMPT_RETENTION = timedelta(hours=25)
-"""Outlive the Order's P1D expiry by a safety margin before rotating its key."""
+_RECONCILIATION_DEADLINE = timedelta(hours=25)
+"""After the Order's P1D window, stop and reconcile; never rotate by clock alone."""
 
 # --- what the seller already has -------------------------------------------------
 
@@ -108,11 +109,13 @@ class _CheckoutAttempt:
 
     key: str
     external_reference: str
-    expires_at: datetime
+    reconcile_after: datetime | None = None
     handoffs: tuple[CheckoutHandoff, ...] | None = None
+    unknown_reason: str | None = None
+    order_id: str | None = None
 
 
-# --- the integration itself: two lines ---------------------------------------------
+# --- the integration itself --------------------------------------------------------
 
 class SellerBackend:
     """In a real deployment this subclasses commerce-agents' ``StorefrontBackend`` and
@@ -121,8 +124,8 @@ class SellerBackend:
     ``checkout_handoff`` takes exactly the two arguments commerce-agents calls it with —
     `enrichment.py` does ``await backend.checkout_handoff(context.session, cart)`` — so
     the idempotency key has to be obtained *here*, not passed in from outside. Holding it
-    yourself is also what makes reconciliation possible: a key the adapter generates
-    internally is never handed back.
+    yourself is also what makes reconciliation possible: the adapter deliberately does
+    not generate either recovery identifier.
     """
 
     def __init__(self, sdk: mercadopago.SDK) -> None:
@@ -144,17 +147,52 @@ class SellerBackend:
     async def checkout_handoff(self, session: Session, cart: Cart):
         """Exactly the signature commerce-agents calls."""
         attempt_id, attempt = self._attempt(session, cart)
+        if (
+            attempt.reconcile_after is not None
+            and attempt.reconcile_after <= datetime.now(timezone.utc)
+        ):
+            # Time passing is not authoritative payment state. Even after the expected
+            # expiry, require a GET or verified terminal webhook before a new pair can
+            # create another checkout.
+            raise CheckoutOutcomeUnknown(
+                external_reference=attempt.external_reference,
+                idempotency_key=attempt.key,
+                reason="reconciliation_required",
+                order_id=attempt.order_id,
+            )
         if attempt.handoffs is not None:
             # A host retry after the adapter returned must not rebuild a body from a
             # catalog that may have changed. Return the already-issued checkout instead.
             return list(attempt.handoffs)
+        if attempt.unknown_reason is not None:
+            # A previous POST may have succeeded. Never invoke the adapter again or
+            # expose another checkout until the stored operation is reconciled.
+            raise CheckoutOutcomeUnknown(
+                external_reference=attempt.external_reference,
+                idempotency_key=attempt.key,
+                reason="reconciliation_required",
+                order_id=attempt.order_id,
+            )
 
-        handoffs = await self.mercadopago.checkout_handoff(
-            session,
-            cart,
-            idempotency_key=attempt.key,
-            external_reference=attempt.external_reference,
-        )
+        # Start the retention window immediately before the first possible Orders POST,
+        # not when a key was merely reserved. This keeps the pair for longer than the
+        # payable Order's P1D lifetime even if checkout begins much later.
+        if attempt.reconcile_after is None:
+            attempt.reconcile_after = (
+                datetime.now(timezone.utc) + _RECONCILIATION_DEADLINE
+            )
+
+        try:
+            handoffs = await self.mercadopago.checkout_handoff(
+                session,
+                cart,
+                external_reference=attempt.external_reference,
+                idempotency_key=attempt.key,
+            )
+        except CheckoutOutcomeUnknown as error:
+            attempt.unknown_reason = error.reason
+            attempt.order_id = error.order_id
+            raise
         if handoffs:
             attempt.handoffs = tuple(handoffs)
         else:
@@ -182,16 +220,10 @@ class SellerBackend:
         """Get or durably create the active operation before calling Mercado Pago."""
         attempt_id = (session.session_id, self._fingerprint(cart))
         attempt = self._attempts.get(attempt_id)
-        now = datetime.now(timezone.utc)
-        if attempt is None or attempt.expires_at <= now:
-            # Outlive the Order's P1D window by a safety margin: rotating before the
-            # hosted checkout expires could expose two payable Orders. This is only a
-            # missed-webhook backstop; verified terminal state should close it earlier.
-            self._discard_attempt(attempt_id)
+        if attempt is None:
             attempt = _CheckoutAttempt(
                 key=f"order-{uuid4()}",
                 external_reference=f"seller-order-{uuid4()}",
-                expires_at=now + _ATTEMPT_RETENTION,
             )
             self._attempts[attempt_id] = attempt
             self._attempt_ids_by_reference[attempt.external_reference] = attempt_id

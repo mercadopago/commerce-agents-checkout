@@ -55,7 +55,10 @@ jobs:
       - name: Audit dependencies
         run: |
           pip install "pip-audit==2.9.0"
-          pip-audit --strict --desc
+          # The root project is installed editable and does not exist on PyPI before
+          # the first release. Audit its resolved dependencies without asking PyPI for
+          # the unpublished root distribution itself.
+          pip-audit --strict --desc --skip-editable
 
       - name: Lint with Isort
         run: isort --check-only --diff src tests examples

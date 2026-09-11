@@ -14,7 +14,7 @@ from mercadopago.config import RequestOptions
 
 from examples import seller_integration
 from examples.seller_integration import Cart, CartLine, SellerBackend, Session
-from mercadopago_commerce_agents import CheckoutHandoff
+from mercadopago_commerce_agents import CheckoutHandoff, CheckoutOutcomeUnknown
 
 TOKEN = "test-access-token"  # no request leaves the process
 
@@ -40,22 +40,33 @@ class SellerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await backend.finish_checkout_attempt(reference_a)
 
         self.assertNotEqual(await backend.checkout_key(session, cart_a), key_a)
+        self.assertNotEqual(
+            await backend.checkout_reference(session, cart_a), reference_a
+        )
 
-    async def test_expired_attempt_does_not_reuse_the_key_forever(self):
+    async def test_elapsed_deadline_blocks_without_rotating_the_attempt(self):
         backend = self._backend()
         session = Session("session-1")
         cart = Cart(items=[CartLine("tshirt-m", "49.90", 1)])
-        original = await backend.checkout_key(session, cart)
-        attempt_id, attempt = backend._attempt(session, cart)  # pylint: disable=protected-access
-        attempt.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-
-        replacement = await backend.checkout_key(session, cart)
-
-        self.assertNotEqual(replacement, original)
-        self.assertEqual(
-            backend._attempts[attempt_id].key,  # pylint: disable=protected-access
-            replacement,
+        original_key = await backend.checkout_key(session, cart)
+        original_reference = await backend.checkout_reference(session, cart)
+        _, attempt = backend._attempt(  # pylint: disable=protected-access
+            session, cart
         )
+        attempt.reconcile_after = datetime.now(timezone.utc) - timedelta(seconds=1)
+        backend.mercadopago.checkout_handoff = mock.AsyncMock()
+
+        with self.assertRaises(CheckoutOutcomeUnknown) as captured:
+            await backend.checkout_handoff(session, cart)
+
+        self.assertEqual(captured.exception.idempotency_key, original_key)
+        self.assertEqual(captured.exception.external_reference, original_reference)
+        self.assertEqual(captured.exception.reason, "reconciliation_required")
+        self.assertEqual(await backend.checkout_key(session, cart), original_key)
+        self.assertEqual(
+            await backend.checkout_reference(session, cart), original_reference
+        )
+        backend.mercadopago.checkout_handoff.assert_not_awaited()
 
     async def test_successful_handoff_is_reused_without_rebuilding_the_order(self):
         backend = self._backend()
@@ -63,13 +74,68 @@ class SellerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         backend.mercadopago.checkout_handoff = mock.AsyncMock(return_value=expected)
         session = Session("session-1")
         cart = Cart(items=[CartLine("tshirt-m", "49.90", 1)])
+        key = await backend.checkout_key(session, cart)
+        reference = await backend.checkout_reference(session, cart)
 
         first = await backend.checkout_handoff(session, cart)
         second = await backend.checkout_handoff(session, cart)
 
         self.assertEqual(first, expected)
         self.assertEqual(second, expected)
-        backend.mercadopago.checkout_handoff.assert_awaited_once()
+        backend.mercadopago.checkout_handoff.assert_awaited_once_with(
+            session,
+            cart,
+            external_reference=reference,
+            idempotency_key=key,
+        )
+
+    async def test_reconciliation_deadline_starts_before_the_api_call(self):
+        backend = self._backend()
+        handoff = [CheckoutHandoff(url="https://www.mercadopago.com.br/checkout")]
+        backend.mercadopago.checkout_handoff = mock.AsyncMock(return_value=handoff)
+        session = Session("session-1")
+        cart = Cart(items=[CartLine("tshirt-m", "49.90", 1)])
+
+        _, attempt = backend._attempt(  # pylint: disable=protected-access
+            session, cart
+        )
+        self.assertIsNone(attempt.reconcile_after)
+
+        await backend.checkout_handoff(session, cart)
+
+        self.assertIsNotNone(attempt.reconcile_after)
+        self.assertGreater(attempt.reconcile_after, datetime.now(timezone.utc))
+
+    async def test_unknown_outcome_is_sticky_until_reconciliation(self):
+        backend = self._backend()
+        session = Session("session-1")
+        cart = Cart(items=[CartLine("tshirt-m", "49.90", 1)])
+        key = await backend.checkout_key(session, cart)
+        reference = await backend.checkout_reference(session, cart)
+        adapter_error = CheckoutOutcomeUnknown(
+            external_reference=reference,
+            idempotency_key=key,
+            order_id="ORD-unknown",
+            reason="transport_failure",
+        )
+        backend.mercadopago.checkout_handoff = mock.AsyncMock(side_effect=adapter_error)
+
+        with self.assertRaises(CheckoutOutcomeUnknown) as first:
+            await backend.checkout_handoff(session, cart)
+        with self.assertRaises(CheckoutOutcomeUnknown) as second:
+            await backend.checkout_handoff(session, cart)
+
+        self.assertIs(first.exception, adapter_error)
+        self.assertEqual(second.exception.idempotency_key, key)
+        self.assertEqual(second.exception.external_reference, reference)
+        self.assertEqual(second.exception.order_id, "ORD-unknown")
+        self.assertEqual(second.exception.reason, "reconciliation_required")
+        backend.mercadopago.checkout_handoff.assert_awaited_once_with(
+            session,
+            cart,
+            external_reference=reference,
+            idempotency_key=key,
+        )
 
     async def test_webhook_reference_closes_a_after_navigation_to_b(self):
         backend = self._backend()

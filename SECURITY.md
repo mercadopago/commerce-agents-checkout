@@ -35,7 +35,7 @@ project is pre-release today; see [CHANGELOG.md](CHANGELOG.md).
 
 - Anything that lets a cart, session, model-authored text, or Mercado Pago response
   change the amount, currency, items, or destination of a created order.
-- Bypasses of trusted-catalog repricing, confirmation, idempotency or supplied
+- Bypasses of trusted-catalog repricing, confirmation, idempotency or required
   external-reference validation, or the `checkout_url` host allowlist.
 - Credentials, session identifiers, Order IDs, seller references, idempotency keys,
   payloads, PII, or complete checkout URLs reaching logs or exception messages from the

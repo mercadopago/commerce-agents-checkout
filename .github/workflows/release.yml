@@ -120,10 +120,13 @@ jobs:
           python -m venv /tmp/artifact-check
           /tmp/artifact-check/bin/pip install --upgrade pip==26.2.1
           /tmp/artifact-check/bin/pip install dist/*.whl
+          /tmp/artifact-check/bin/pip check
+          # Prove the wheel imports before removing only the unpublished root package.
+          # Its installed dependencies remain and are what pip-audit evaluates below.
+          /tmp/artifact-check/bin/python -c "import mercadopago_commerce_agents as m; print(m.__all__)"
+          /tmp/artifact-check/bin/pip uninstall --yes mercadopago-commerce-agents-checkout
           /tmp/artifact-check/bin/pip install "pip-audit==2.9.0"
           /tmp/artifact-check/bin/pip-audit --strict --desc
-          # And prove the published package imports with nothing else present.
-          /tmp/artifact-check/bin/python -c "import mercadopago_commerce_agents as m; print(m.__all__)"
 
       - name: Store distributions
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

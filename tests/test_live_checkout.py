@@ -28,6 +28,7 @@ class _FakeOrder:
     def create(self, body, request_options=None):
         """Replay the same logical Order for a repeated idempotency key."""
         key = request_options.get_headers()["x-idempotency-key"]
+        external_reference = body["external_reference"]
         self.create_calls.append((body, key))
         if self.order is None:
             self.order = {
@@ -40,9 +41,8 @@ class _FakeOrder:
                 "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
                 "integration_data": body["integration_data"],
+                "external_reference": external_reference,
             }
-            if "external_reference" in body:
-                self.order["external_reference"] = body["external_reference"]
         return {"status": 201, "response": dict(self.order)}
 
     def cancel(self, order_id, request_options=None):
@@ -97,28 +97,46 @@ class LiveCheckoutTest(unittest.IsolatedAsyncioTestCase):
         resource, output = await self._run("create-order")
 
         self.assertEqual(len(resource.create_calls), 2)
-        self.assertEqual(resource.create_calls[0], resource.create_calls[1])
+        first_body, first_key = resource.create_calls[0]
+        retried_body, retried_key = resource.create_calls[1]
+        external_reference = first_body["external_reference"]
+        self.assertEqual(retried_body, first_body)
+        self.assertEqual(retried_key, first_key)
+        self.assertEqual(retried_body["external_reference"], external_reference)
+        self.assertEqual(resource.order["external_reference"], external_reference)
         self.assertIn("Retry verified", output)
         self.assertIn("URL verified and withheld", output)
         self.assertNotIn(CHECKOUT_URL, output)
+        self.assertNotIn("ORD-LIVE", output)
+        self.assertNotIn(first_key, output)
+        self.assertNotIn(external_reference, output)
 
-    async def test_create_mode_prints_url_only_after_interactive_opt_in(self):
-        _, output = await self._run("create-order", show_checkout_url=True)
+    async def test_create_mode_prints_sensitive_values_only_after_interactive_opt_in(self):
+        resource, output = await self._run("create-order", show_checkout_url=True)
+        body, key = resource.create_calls[0]
 
         self.assertIn(CHECKOUT_URL, output)
+        self.assertIn("ORD-LIVE", output)
+        self.assertNotIn(key, output)
+        self.assertNotIn(body["external_reference"], output)
 
-    async def test_cancellation_mode_proves_cleanup_without_printing_the_url(self):
+    async def test_cancellation_mode_proves_cleanup_without_printing_identifiers(self):
         resource, output = await self._run("verify-cancellation")
 
         self.assertEqual(len(resource.create_calls), 1)
         order_id, options = resource.cancel_call
         create_key = resource.create_calls[0][1]
+        external_reference = resource.create_calls[0][0]["external_reference"]
         cancel_key = options.get_headers()["x-idempotency-key"]
         self.assertEqual(order_id, "ORD-LIVE")
         self.assertNotEqual(cancel_key, create_key)
+        self.assertEqual(resource.order["external_reference"], external_reference)
         self.assertEqual(resource.order["status"], "canceled")
         self.assertIn("Cleanup verified", output)
         self.assertNotIn(CHECKOUT_URL, output)
+        self.assertNotIn("ORD-LIVE", output)
+        self.assertNotIn(create_key, output)
+        self.assertNotIn(external_reference, output)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 
 This is intentionally opt-in because it calls the real Mercado Pago API and creates a
 payable test order. It never prints the access token, and it prints the complete checkout
-URL only after a second explicit opt-in from an interactive terminal. See
+URL and Order ID only after a second explicit opt-in from an interactive terminal. See
 ``docs/testing.md``.
 """
 
@@ -115,12 +115,13 @@ class _LiveContext:
     checkout: MercadoPagoCheckout
     recording_sdk: _RecordingSDK
     currency: str
+    external_reference: str
     idempotency_key: str
-    show_checkout_url: bool
+    show_sensitive_output: bool
 
 
-def _show_checkout_url() -> bool:
-    """Allow the complete hosted URL only after explicit interactive opt-in."""
+def _show_sensitive_output() -> bool:
+    """Allow the complete hosted URL and Order ID only after interactive opt-in."""
     requested = os.environ.get("MERCADOPAGO_LIVE_SHOW_CHECKOUT_URL") == "1"
     if requested and not sys.stdout.isatty():
         raise SystemExit(
@@ -143,6 +144,8 @@ async def _verify_cancellation(
     recording_sdk: _RecordingSDK,
     order_id: str,
     handoffs: list[CheckoutHandoff],
+    *,
+    show_sensitive_output: bool,
 ) -> None:
     """Prove the refused Order reached the terminal canceled state."""
     if handoffs:
@@ -159,7 +162,10 @@ async def _verify_cancellation(
             and isinstance(response, dict)
             and response.get("status") == "canceled"
         ):
-            print(f"Order id: {order_id}")
+            if show_sensitive_output:
+                print(f"Order id: {order_id}")
+            else:
+                print("Order id verified and withheld from output.")
             print("Cleanup verified: refused order status is canceled.")
             return
         await asyncio.sleep(1)
@@ -182,6 +188,7 @@ async def _verify_checkout(
     retried = await context.checkout.checkout_handoff(
         _Session(session_id=f"live-session-retry-{uuid4()}"),
         _Cart(currency=context.currency),
+        external_reference=context.external_reference,
         idempotency_key=context.idempotency_key,
     )
     replayed = context.recording_sdk.order().created
@@ -197,13 +204,19 @@ async def _verify_checkout(
     response = result.get("response")
     if result.get("status") != 200 or not isinstance(response, dict):
         raise SystemExit("Created order could not be read back from Mercado Pago")
-    if response.get("id") != order_id:
-        raise SystemExit("Read-back order id did not match the checkout URL")
+    if (
+        response.get("id") != order_id
+        or response.get("external_reference") != context.external_reference
+    ):
+        raise SystemExit("Read-back order did not match the persisted checkout attempt")
 
-    print(f"Order id: {order_id}")
+    if context.show_sensitive_output:
+        print(f"Order id: {order_id}")
+    else:
+        print("Order id verified and withheld from output.")
     print(f"Order status: {response.get('status')}")
     print(f"Integration data: {response.get('integration_data')}")
-    if context.show_checkout_url:
+    if context.show_sensitive_output:
         print(f"Checkout Pro URL: {checkout_url}")
     else:
         print("Checkout Pro URL verified and withheld from output.")
@@ -224,23 +237,31 @@ async def main() -> None:
             "verify-cancellation to create one test order"
         )
 
-    show_checkout_url = _show_checkout_url()
+    show_sensitive_output = _show_sensitive_output()
 
     sdk = mercadopago.SDK(token)
     verify_cancellation = confirmation == "verify-cancellation"
     recording_sdk = _RecordingSDK(sdk, force_mismatch=verify_cancellation)
     idempotency_key = str(uuid4())
+    external_reference = f"seller-order-{uuid4()}"
 
     checkout = MercadoPagoCheckout(sdk=recording_sdk, catalog=_Catalog(currency))
     handoffs = await checkout.checkout_handoff(
         _Session(session_id=f"live-session-{uuid4()}"),
         _Cart(currency=currency),
+        external_reference=external_reference,
         idempotency_key=idempotency_key,
     )
     order_id = _created_order_id(recording_sdk)
 
     if verify_cancellation:
-        await _verify_cancellation(sdk, recording_sdk, order_id, handoffs)
+        await _verify_cancellation(
+            sdk,
+            recording_sdk,
+            order_id,
+            handoffs,
+            show_sensitive_output=show_sensitive_output,
+        )
         return
 
     await _verify_checkout(
@@ -249,8 +270,9 @@ async def main() -> None:
             checkout=checkout,
             recording_sdk=recording_sdk,
             currency=currency,
+            external_reference=external_reference,
             idempotency_key=idempotency_key,
-            show_checkout_url=show_checkout_url,
+            show_sensitive_output=show_sensitive_output,
         ),
         handoffs,
         order_id,

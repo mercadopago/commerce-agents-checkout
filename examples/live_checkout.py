@@ -139,6 +139,19 @@ def _created_order_id(recording_sdk: _RecordingSDK) -> str:
     return order_id
 
 
+async def _read_order(sdk: mercadopago.SDK, order_id: str) -> dict:
+    """Read an Order without exposing SDK exception details or request URLs."""
+    try:
+        result = await asyncio.to_thread(sdk.order().get, order_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # SDK exceptions can contain the request URL, whose path carries the Order ID,
+        # or authentication headers. A fixed, unchained error is safe for terminal logs.
+        raise SystemExit("Mercado Pago Order read-back failed") from None
+    if not isinstance(result, dict):
+        raise SystemExit("Mercado Pago Order read-back failed") from None
+    return result
+
+
 async def _verify_cancellation(
     sdk: mercadopago.SDK,
     recording_sdk: _RecordingSDK,
@@ -155,7 +168,7 @@ async def _verify_cancellation(
         raise SystemExit("Mercado Pago did not confirm cleanup of the refused order")
 
     for _ in range(5):
-        result = await asyncio.to_thread(sdk.order().get, order_id)
+        result = await _read_order(sdk, order_id)
         response = result.get("response")
         if (
             result.get("status") == 200
@@ -200,7 +213,7 @@ async def _verify_checkout(
     ):
         raise SystemExit("Retry with the same key did not return the original order")
 
-    result = await asyncio.to_thread(context.sdk.order().get, order_id)
+    result = await _read_order(context.sdk, order_id)
     response = result.get("response")
     if result.get("status") != 200 or not isinstance(response, dict):
         raise SystemExit("Created order could not be read back from Mercado Pago")

@@ -1403,6 +1403,100 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("1234.56", logged)
         self.assertNotIn("Secret product", logged)
 
+    async def test_orders_api_rejection_logs_only_safe_error_codes(self):
+        recorder = _Recorder(
+            status=400,
+            response={
+                "errors": [
+                    {
+                        "code": "required_properties",
+                        "message": "external_reference seller-order-secret is required",
+                    },
+                    {"code": "invalid_token"},
+                    {"code": "invalid_token\nforged log line"},
+                    {"code": "seller-order-private"},
+                    {"code": "required_properties"},
+                    {"code": 42},
+                    "not-an-error-object",
+                ]
+            },
+        )
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        with self.assertLogs(checkout_module.logger, "ERROR") as captured:
+            handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
+
+        logged = "\n".join(captured.output)
+        self.assertEqual(handoffs, [])
+        self.assertEqual(logged.count("required_properties"), 1)
+        self.assertIn("invalid_token", logged)
+        self.assertNotIn("seller-order-secret", logged)
+        self.assertNotIn("seller-order-private", logged)
+        self.assertNotIn("forged log line", logged)
+        self.assertNotIn("42", logged)
+
+    async def test_orders_api_error_codes_are_bounded(self):
+        documented_codes = (
+            "empty_required_header",
+            "invalid_idempotency_key_length",
+            "required_properties",
+            "unsupported_properties",
+            "minimum_properties",
+            "property_type",
+            "minimum_items",
+            "maximum_items",
+            "property_value",
+            "json_syntax_error",
+            "invalid_properties",
+            "invalid_total_amount",
+            "invalid_email_for_sandbox",
+            "order_invalid_sponsor_id",
+            "invalid_header_value",
+            "order_builder_without_transactions",
+            "invalid_order_type",
+            "invalid_credentials",
+            "forbidden",
+            "PA_UNAUTHORIZED_RESULT_FROM_POLICIES",
+            "resource_locked",
+        )
+        recorder = _Recorder(
+            status=400,
+            response={
+                "errors": [{"code": code} for code in documented_codes]
+            },
+        )
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        with self.assertLogs(checkout_module.logger, "ERROR") as captured:
+            await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
+
+        logged = "\n".join(captured.output)
+        self.assertIn("PA_UNAUTHORIZED_RESULT_FROM_POLICIES", logged)
+        self.assertNotIn("resource_locked", logged)
+
+    async def test_api_error_codes_are_arguments_to_a_fixed_log_template(self):
+        recorder = _Recorder(
+            status=400,
+            response={
+                "error": "bad_request",
+                "errors": [
+                    {"code": "required_properties"},
+                    {"code": "bad_request"},
+                ],
+                "cause": [{"code": 2034}, {"code": 2034}],
+            },
+        )
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        with mock.patch.object(checkout_module.logger, "error") as log_error:
+            await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
+
+        log_error.assert_called_once_with(
+            "Order creation failed (HTTP %s): codes=%s",
+            400,
+            ["bad_request", "required_properties", "2034"],
+        )
+
     async def test_rejects_fractional_or_excessive_quantities(self):
         for quantity in (1.5, 0, 11, "not-a-number"):
             with self.subTest(quantity=quantity):

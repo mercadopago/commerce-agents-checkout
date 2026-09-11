@@ -97,10 +97,47 @@ _IDEMPOTENCY_HEADER = "x-idempotency-key"
 _CATALOG_FIELDS = ("title", "price", "currency", "in_stock")
 _MAX_CHECKOUT_URL = 2048
 _MAX_DECIMAL_TEXT = 64
+_MAX_LOG_CODES = 20
+_MAX_NUMERIC_ERROR_CODE = 2**31 - 1
 _AMOUNT_QUANTUM = Decimal("0.01")
-_LOG_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 _CURRENCY = re.compile(r"[A-Z]{3}\Z")
 _EXTERNAL_REFERENCE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+
+# The create-Order codes documented by Mercado Pago, plus stable gateway/legacy codes
+# observed for the same endpoint. A syntax-only filter is insufficient here: a seller
+# reference or token-shaped value can also consist only of identifier characters.
+_LOGGABLE_ORDER_ERROR_CODES = frozenset(
+    {
+        "PA_UNAUTHORIZED_RESULT_FROM_POLICIES",
+        "bad_request",
+        "empty_required_header",
+        "forbidden",
+        "idempotency_key_already_used",
+        "idempotency_validation_failed",
+        "internal_error",
+        "invalid_credentials",
+        "invalid_email_for_sandbox",
+        "invalid_header_value",
+        "invalid_idempotency_key_length",
+        "invalid_order_type",
+        "invalid_properties",
+        "invalid_token",
+        "invalid_total_amount",
+        "json_syntax_error",
+        "maximum_items",
+        "minimum_items",
+        "minimum_properties",
+        "order_builder_without_transactions",
+        "order_invalid_sponsor_id",
+        "property_type",
+        "property_value",
+        "required_properties",
+        "resource_locked",
+        "too_many_requests",
+        "unsupported_properties",
+        "usage_quota_exceeded",
+    }
+)
 
 # Checkout Pro Orders uses an ISO 8601 duration, not an absolute preference timestamp.
 # Keeping it relative also makes retries carry an identical body.
@@ -625,13 +662,12 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                     "retry_inconclusive",
                 )
             logger.error(
-                "Order creation failed (HTTP %s): error=%s causes=%s",
+                "Order creation failed (HTTP %s): codes=%s",
                 status,
                 # Only MP's own error identifiers are logged. The rest of a 4xx body
                 # echoes the rejected payload — item titles, prices, the reference —
                 # which does not belong in logs.
-                _safe_str(payload.get("error")) if isinstance(payload, dict) else None,
-                _cause_codes(payload),
+                _error_codes(payload),
             )
             return None
         if not 200 <= status < 300 or not isinstance(payload, dict):
@@ -732,10 +768,9 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             return False
 
 
-def _safe_str(value: Any) -> str | None:
-    """MP's ``error`` field is a short identifier (``bad_request``); anything longer is
-    not that field and is dropped rather than logged."""
-    if not isinstance(value, str) or _LOG_IDENTIFIER.fullmatch(value) is None:
+def _safe_error_code(value: Any) -> str | None:
+    """Return only a documented or explicitly recognized Order error code."""
+    if not isinstance(value, str) or value not in _LOGGABLE_ORDER_ERROR_CODES:
         return None
     return value
 
@@ -847,18 +882,47 @@ def _order_total(items: list[_PricedItem]) -> str | None:
         return None
 
 
-def _cause_codes(payload: Any) -> list[Any]:
-    """The numeric codes from MP's ``cause`` list — enough to look the rejection up in
-    the API reference, without the descriptions that quote the payload."""
+def _error_codes(payload: Any) -> list[str]:
+    """Collect bounded error identifiers across current and legacy API envelopes.
+
+    Messages and details can echo request data, so textual values must be explicitly
+    recognized and legacy numeric causes are bounded. Codes are globally deduplicated
+    and capped to prevent a malformed SDK response from amplifying logs.
+    """
     if not isinstance(payload, dict):
         return []
+
+    codes: list[str] = []
+    legacy_error = _safe_error_code(payload.get("error"))
+    if legacy_error is not None:
+        codes.append(legacy_error)
+
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for error in errors[:_MAX_LOG_CODES]:
+            code = (
+                _safe_error_code(error.get("code"))
+                if isinstance(error, dict)
+                else None
+            )
+            if code is not None and code not in codes:
+                codes.append(code)
+                if len(codes) >= _MAX_LOG_CODES:
+                    return codes
+
     causes = payload.get("cause")
-    if not isinstance(causes, list):
-        return []
-    return [
-        code
-        for cause in causes
-        if isinstance(cause, dict)
-        and isinstance((code := cause.get("code")), int)
-        and not isinstance(code, bool)
-    ]
+    if isinstance(causes, list):
+        for cause in causes[:_MAX_LOG_CODES]:
+            raw_code = cause.get("code") if isinstance(cause, dict) else None
+            code = (
+                str(raw_code)
+                if isinstance(raw_code, int)
+                and not isinstance(raw_code, bool)
+                and 0 <= raw_code <= _MAX_NUMERIC_ERROR_CODE
+                else None
+            )
+            if code is not None and code not in codes:
+                codes.append(code)
+                if len(codes) >= _MAX_LOG_CODES:
+                    return codes
+    return codes

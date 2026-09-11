@@ -160,9 +160,11 @@ failure, then confirm its current meaning in the
 [Orders API reference](https://www.mercadopago.com.pe/developers/en/reference/online-payments/checkout-pro/create-order/post)
 and the supported SDK instead of depending on response descriptions in this document.
 
-Logs contain reason codes and Mercado Pago error codes only. They omit tokens, session
-IDs, idempotency keys, seller references, prices, product identifiers, payloads, response
-bodies, and checkout URLs.
+Logs contain reason codes and a globally bounded, deduplicated `codes` list combining
+recognized Orders API `errors[].code` values with legacy `error`/numeric `cause[].code`
+values. Unknown textual codes are omitted until they are reviewed and added to the
+allowlist. Logs omit tokens, session IDs, idempotency keys, seller references, prices,
+product identifiers, payloads, response bodies, and checkout URLs.
 
 ### Observing refusals
 

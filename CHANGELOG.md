@@ -50,8 +50,13 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 - Returns `[]` and logs a bounded reason code on definitive refusals. Indeterminate
   remote outcomes stop fallback until the host reconciles them. Payment and recovery
   identifiers are excluded from adapter logs.
+- Parses recognized Orders API `errors[].code` values without logging response messages,
+  details or request data, while preserving the legacy `error` and numeric `cause`
+  diagnostics.
 - Example scripts redact checkout URLs, idempotency keys and external references by
-  default; complete values require explicit opt-in from an interactive terminal.
+  default; complete values require explicit opt-in from an interactive terminal. SDK
+  failures during Order read-back terminate with a fixed message rather than exposing
+  the underlying request URL or headers.
 - `CheckoutHandoff` redacts its URL from `repr` while preserving it in `model_dump()`.
 
 ### What it deliberately leaves to the host

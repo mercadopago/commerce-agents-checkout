@@ -118,7 +118,7 @@ jobs:
           # The CI job audits a development environment; this audits the environment a
           # user gets from this wheel, which is the one that ships.
           python -m venv /tmp/artifact-check
-          /tmp/artifact-check/bin/pip install --upgrade pip==26.2.1
+          /tmp/artifact-check/bin/pip install --upgrade pip==26.2.1 setuptools==83.0.0
           /tmp/artifact-check/bin/pip install dist/*.whl
           /tmp/artifact-check/bin/pip check
           # Prove the wheel imports before removing only the unpublished root package.

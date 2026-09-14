@@ -58,15 +58,26 @@ for the reproducible command.
 
 ## Install
 
-The first public build is a beta. Install that exact version explicitly:
+The current beta is published only on TestPyPI. Install its runtime dependencies from
+PyPI first, then install the exact beta from TestPyPI without resolving dependencies
+there:
 
 ```bash
-pip install --pre mercadopago-commerce-agents-checkout==0.1.0b1
+python -m pip install \
+  "mercadopago>=3.5.0" \
+  "requests>=2.33.0,<3" \
+  "certifi>=2024.7.4" \
+  "idna>=3.15,<4" \
+  "urllib3>=2.7.0,<3"
+python -m pip install --no-deps \
+  --index-url https://test.pypi.org/simple/ \
+  mercadopago-commerce-agents-checkout==0.1.0b2
 ```
 
 Pre-release versions are intentionally not selected by every dependency resolver unless
-the caller opts in with `--pre` or pins the exact version. Remove the version pin and
-`--pre` after a stable release is available.
+the caller pins the exact version. Keeping dependency resolution on PyPI also avoids
+selecting unrelated TestPyPI projects. Use the normal PyPI index and remove the version
+pin after a stable release is available.
 
 The distribution name and the import name differ on purpose — the distribution is
 scoped to this checkout adapter, while the import package is the one commerce-agents

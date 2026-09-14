@@ -58,11 +58,15 @@ for the reproducible command.
 
 ## Install
 
-Install from PyPI:
+The first public build is a beta. Install that exact version explicitly:
 
 ```bash
-pip install mercadopago-commerce-agents-checkout
+pip install --pre mercadopago-commerce-agents-checkout==0.1.0b1
 ```
+
+Pre-release versions are intentionally not selected by every dependency resolver unless
+the caller opts in with `--pre` or pins the exact version. Remove the version pin and
+`--pre` after a stable release is available.
 
 The distribution name and the import name differ on purpose — the distribution is
 scoped to this checkout adapter, while the import package is the one commerce-agents

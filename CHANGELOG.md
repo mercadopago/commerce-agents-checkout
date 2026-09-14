@@ -9,7 +9,7 @@ the request sent to Mercado Pago, the conditions under which a handoff is refuse
 public constructor surface — those are the three things a consuming host must re-verify
 before upgrading.
 
-## [Unreleased] — first release
+## [0.1.0b1] - 2026-09-14
 
 Mercado Pago Checkout Pro as a `checkout_handoff` provider for
 [anthropics/commerce-agents](https://github.com/anthropics/commerce-agents), built on

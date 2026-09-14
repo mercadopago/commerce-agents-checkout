@@ -106,10 +106,26 @@ jobs:
           verified="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.verification.verified')"
           test "${verified}" = "true"
 
-      - name: Verify the tagged commit belongs to main
+      - name: Verify the release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          REVIEWED_PR_HEAD: 6b005a86f1fcb6f0e6fd95b5640b22cace909653
         run: |
-          git show-ref --verify --quiet refs/remotes/origin/main
-          git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+          set -euo pipefail
+
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            # This one-off beta must package the reviewed PR tree. Its signed
+            # release commit may change only this workflow to enable TestPyPI.
+            test "${GITHUB_REF_NAME}" = "v0.1.0b1"
+            test "$(git rev-parse "${GITHUB_SHA}^")" = "${REVIEWED_PR_HEAD}"
+            test "$(git diff --name-only "${REVIEWED_PR_HEAD}" "${GITHUB_SHA}")" = ".github/workflows/release.yml"
+            commit_verified="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.verification.verified')"
+            test "${commit_verified}" = "true"
+          else
+            git show-ref --verify --quiet refs/remotes/origin/main
+            git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+          fi
 
       - name: Build and validate distributions
         env:
@@ -314,6 +330,7 @@ jobs:
             'import os; from importlib.metadata import version; import mercadopago_commerce_agents; assert version("mercadopago-commerce-agents-checkout") == os.environ["PACKAGE_VERSION"]'
 
   publish-pypi:
+    if: github.event.release.prerelease == false
     needs: validate-testpypi
     runs-on: ubuntu-latest
     environment:
@@ -365,6 +382,7 @@ jobs:
           dist/*
 
   validate-pypi:
+    if: github.event.release.prerelease == false
     needs: publish-pypi
     runs-on: ubuntu-latest
     steps:

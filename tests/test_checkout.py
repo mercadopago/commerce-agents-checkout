@@ -32,7 +32,14 @@ from mercadopago_commerce_agents import checkout as checkout_module
 
 TOKEN = "test-access-token"  # not a credential: no request leaves the process
 CHECKOUT_URL = "https://www.mercadopago.com.br/checkout/v1/redirect?order_id=ORD-1"
+# The hosted link is bound to the Order it pays, so a fixture that returns a
+# different id needs the matching link.
+FLOOR_CHECKOUT_URL = (
+    "https://www.mercadopago.com.br/checkout/v1/redirect?order_id=ORD-FLOOR"
+)
 EXTERNAL_REFERENCE = "seller-order-1"
+# Distinguishes "the API omitted this field" from "the API sent null".
+_ABSENT = object()
 IDEMPOTENCY_KEY = "operation-1"
 
 
@@ -120,7 +127,7 @@ class _Recorder:
 class _FakeHttpClient(HttpClient):
     """No-network transport that keeps the official SDK Order resource in the path."""
 
-    def __init__(self, *, checkout_url=CHECKOUT_URL):
+    def __init__(self, *, checkout_url=FLOOR_CHECKOUT_URL):
         self.checkout_url = checkout_url
         self.calls = []
 
@@ -780,6 +787,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 "status": "created",
                 "currency": "BRL",
                 "total_amount": body["total_amount"],
+                "external_reference": body["external_reference"],
             }
         )
         sdk = mock.MagicMock()
@@ -811,6 +819,7 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 "currency": "BRL",
                 "expiration_time": "P1D",
                 "total_amount": body["total_amount"],
+                "external_reference": body["external_reference"],
             }
         )
         sdk = mock.MagicMock()
@@ -832,7 +841,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
     async def test_reports_a_cancellation_the_api_rejects(self):
         """A MagicMock returns a truthy object, not a 2xx — the success and failure
         paths have to be told apart explicitly."""
-        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "external_reference": body["external_reference"],
+            }
+        )
         sdk = mock.MagicMock()
         sdk.order.return_value.cancel.return_value = {"status": 409, "response": {}}
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
@@ -847,7 +861,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("409" in line for line in logged.output))
 
     async def test_logs_a_cancellation_the_api_accepts(self):
-        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "external_reference": body["external_reference"],
+            }
+        )
         sdk = mock.MagicMock()
         sdk.order.return_value.cancel.return_value = {
             "status": 200,
@@ -862,7 +881,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Cancelled a refused order" in line for line in logged.output))
 
     async def test_cancellation_status_cannot_inject_logs(self):
-        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "external_reference": body["external_reference"],
+            }
+        )
         sdk = mock.MagicMock()
         sdk.order.return_value.cancel.return_value = {
             "status": "409\nforged-log-entry",
@@ -879,7 +903,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("ORD-1" in line for line in logged.output))
 
     async def test_unconfirmed_cancellation_body_blocks_the_fallback(self):
-        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "external_reference": body["external_reference"],
+            }
+        )
         for response in (
             {},
             {"id": "ORD-2", "status": "canceled"},
@@ -914,7 +943,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_failed_cancellation_blocks_the_fallback(self):
         """An unconfirmed cleanup may leave an order payable, so [] is unsafe."""
-        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "external_reference": body["external_reference"],
+            }
+        )
         sdk = mock.MagicMock()
         sdk.order.return_value.cancel.side_effect = RuntimeError("cancel exploded")
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
@@ -935,7 +969,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         started = threading.Event()
         release = threading.Event()
         finished = threading.Event()
-        recorder = _Recorder(response=lambda body: {"id": "ORD-1"})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "external_reference": body["external_reference"],
+            }
+        )
         sdk = mock.MagicMock()
 
         def cancel(order_id, request_options=None):
@@ -972,7 +1011,12 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured.exception.order_id, "ORD-1")
 
     async def test_an_unreadable_order_id_blocks_the_fallback(self):
-        recorder = _Recorder(response=lambda body: {"id": None})
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": None,
+                "external_reference": body["external_reference"],
+            }
+        )
         sdk = mock.MagicMock()
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
 
@@ -997,7 +1041,11 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         """`checkout_url` is rendered as the official payment button, so a
         response pointing anywhere else is dropped rather than handed over."""
         recorder = _Recorder(
-            response={"id": "ORD-1", "checkout_url": "https://evil.example/pay"}
+            response={
+                "id": "ORD-1",
+                "checkout_url": "https://evil.example/pay",
+                "external_reference": EXTERNAL_REFERENCE,
+            }
         )
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
 
@@ -1006,11 +1054,83 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handoffs, [])
 
+    async def test_rejects_a_checkout_url_that_pays_another_order(self):
+        """The host allowlist proves the link is Mercado Pago's, not that it is ours.
+
+        A response carrying our ``id`` next to a link for a different order is
+        well-formed and passes every host check, so the ``order_id`` in the link is
+        what binds the two.
+        """
+        base = "https://www.mercadopago.com.br/checkout/v1/redirect"
+        for label, checkout_url in (
+            ("divergent", f"{base}?order_id=ORD-OTHER"),
+            ("duplicated", f"{base}?order_id=ORD-1&order_id=ORD-OTHER"),
+            ("absent", f"{base}?pref_id=1234-abcd"),
+            ("empty", f"{base}?order_id="),
+            ("no query at all", base),
+        ):
+            with self.subTest(checkout_url=label):
+                recorder = _Recorder(
+                    response=lambda body, url=checkout_url: {
+                        "id": "ORD-1",
+                        "checkout_url": url,
+                        "type": "online",
+                        "processing_mode": "manual",
+                        "status": "created",
+                        "currency": "BRL",
+                        "expiration_time": "P1D",
+                        "total_amount": body["total_amount"],
+                        "external_reference": body["external_reference"],
+                    }
+                )
+                sdk = mock.MagicMock()
+                checkout = self._checkout(
+                    recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk
+                )
+
+                with self.assertLogs(checkout_module.logger, "ERROR"):
+                    handoffs = await self._handoff(
+                        checkout, _Session(), _Cart(_Line("sku1"))
+                    )
+
+                self.assertEqual(handoffs, [])
+                # Correlated, so the stranded Order is ours to cancel.
+                sdk.order.return_value.cancel.assert_called_once()
+                self.assertEqual(
+                    sdk.order.return_value.cancel.call_args.args[0], "ORD-1"
+                )
+
+    async def test_accepts_the_checkout_url_that_pays_this_order(self):
+        """The shape Mercado Pago actually returns, confirmed against the live API."""
+        recorder = _Recorder(
+            response=lambda body: {
+                "id": "ORD-1",
+                "checkout_url": (
+                    "https://www.mercadopago.com.br/checkout/v1/redirect"
+                    "?order_id=ORD-1&pref_id=3497261639-47d42578-7894"
+                ),
+                "type": "online",
+                "processing_mode": "manual",
+                "status": "created",
+                "currency": "BRL",
+                "expiration_time": "P1D",
+                "total_amount": body["total_amount"],
+                "external_reference": body["external_reference"],
+            }
+        )
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+
+        handoffs = await self._handoff(checkout, _Session(), _Cart(_Line("sku1")))
+
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn("order_id=ORD-1", handoffs[0].url)
+
     async def test_rejects_a_plain_http_checkout_url(self):
         recorder = _Recorder(
             response={
                 "id": "ORD-1",
                 "checkout_url": "http://www.mercadopago.com.br/checkout",
+                "external_reference": EXTERNAL_REFERENCE,
             }
         )
         checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
@@ -1031,7 +1151,11 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
         for checkout_url in urls:
             with self.subTest(checkout_url=checkout_url):
                 recorder = _Recorder(
-                    response={"id": "ORD-1", "checkout_url": checkout_url}
+                    response={
+                        "id": "ORD-1",
+                        "checkout_url": checkout_url,
+                        "external_reference": EXTERNAL_REFERENCE,
+                    }
                 )
                 checkout = self._checkout(
                     recorder, catalog=_Catalog(sku1=_Record())
@@ -1088,39 +1212,6 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(handoffs, [])
 
-        recorder = _Recorder(response=response_with(external_reference="another-reference"))
-        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
-        with self.assertLogs(checkout_module.logger, "ERROR"):
-            handoffs = await self._handoff(
-                checkout,
-                _Session(),
-                _Cart(_Line("sku1")),
-                external_reference="expected-reference",
-            )
-        self.assertEqual(handoffs, [])
-
-        recorder = _Recorder(
-            response=lambda body: {
-                "id": "ORD-1",
-                "checkout_url": CHECKOUT_URL,
-                "type": "online",
-                "processing_mode": "manual",
-                "status": "created",
-                "currency": "BRL",
-                "expiration_time": "P1D",
-                "total_amount": body["total_amount"],
-            }
-        )
-        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
-        with self.assertLogs(checkout_module.logger, "ERROR"):
-            handoffs = await self._handoff(
-                checkout,
-                _Session(),
-                _Cart(_Line("sku1")),
-                external_reference="expected-reference",
-            )
-        self.assertEqual(handoffs, [])
-
         recorder = _Recorder(response=response_with(id=""))
         checkout = self._checkout(
             recorder, catalog=_Catalog(sku1=_Record())
@@ -1172,31 +1263,63 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(handoffs, [])
                 self.assertEqual(recorder.calls, [])
 
-    async def test_refuses_a_response_with_a_different_external_reference(self):
-        recorder = _Recorder()
-        recorder.response = lambda body: {
-            "id": "ORD-1",
-            "checkout_url": CHECKOUT_URL,
-            "type": "online",
-            "processing_mode": "manual",
-            "status": "created",
-            "currency": "BRL",
-            "expiration_time": "P1D",
-            "total_amount": body["total_amount"],
-            "external_reference": "not-requested-by-the-seller",
-        }
-        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()))
+    async def test_an_uncorrelated_response_is_never_cancelled(self):
+        """A response we cannot tie to this attempt is not ours to clean up.
 
-        handoffs = await self._handoff(
-            checkout,
-            _Session(session_id="session-from-a-raw-header"),
-            _Cart(_Line("sku1")),
-            external_reference="expected-reference",
-            idempotency_key="op-42",
-        )
+        Cancelling the id it carries would act on an Order that may belong to someone
+        else, so the adapter stops and hands the host something to reconcile with.
+        Covers both shapes: a reference that differs from ours, and one that is absent.
+        """
+        def response_with(**overrides):
+            def response(body):
+                payload = {
+                    "id": "ORD-1",
+                    "checkout_url": CHECKOUT_URL,
+                    "type": "online",
+                    "processing_mode": "manual",
+                    "status": "created",
+                    "currency": "BRL",
+                    "expiration_time": "P1D",
+                    "total_amount": body["total_amount"],
+                    "external_reference": body["external_reference"],
+                }
+                payload.update(overrides)
+                payload = {
+                    key: value for key, value in payload.items() if value is not _ABSENT
+                }
+                return payload
 
-        self.assertEqual(handoffs, [])
-        self.assertEqual(recorder.body["external_reference"], "expected-reference")
+            return response
+
+        for label, response in (
+            ("divergent", response_with(external_reference="not-requested-by-the-seller")),
+            ("absent", response_with(external_reference=_ABSENT)),
+        ):
+            with self.subTest(reference=label):
+                recorder = _Recorder(response=response)
+                sdk = mock.MagicMock()
+                checkout = self._checkout(
+                    recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk
+                )
+
+                with self.assertRaises(CheckoutOutcomeUnknown) as captured:
+                    await self._handoff(
+                        checkout,
+                        _Session(session_id="session-from-a-raw-header"),
+                        _Cart(_Line("sku1")),
+                        external_reference="expected-reference",
+                        idempotency_key="op-42",
+                    )
+
+                self.assertEqual(captured.exception.reason, "uncorrelated_response")
+                self.assertEqual(
+                    captured.exception.external_reference, "expected-reference"
+                )
+                self.assertEqual(captured.exception.idempotency_key, "op-42")
+                # The host still needs something to reconcile against.
+                self.assertEqual(captured.exception.order_id, "ORD-1")
+                sdk.order.return_value.cancel.assert_not_called()
+                self.assertEqual(recorder.body["external_reference"], "expected-reference")
 
     async def test_uses_a_seller_supplied_external_reference_verbatim(self):
         recorder = _Recorder()
@@ -1633,6 +1756,31 @@ class CheckoutHandoffTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured.exception.reason, "ambiguous_response")
         self.assertEqual(captured.exception.idempotency_key, "existing-attempt")
+
+    async def test_http_423_is_a_locked_key_rather_than_a_rejection(self):
+        """423 says a request for this key is still in flight, not that none exists.
+
+        The concurrent request it refers to may already have created a payable Order,
+        so this is the one 4xx that must never release the host fallback.
+        """
+        recorder = _Recorder(status=423, response={"error": "resource_locked"})
+        sdk = mock.MagicMock()
+        checkout = self._checkout(recorder, catalog=_Catalog(sku1=_Record()), sdk=sdk)
+
+        with self.assertRaises(CheckoutOutcomeUnknown) as captured:
+            await self._handoff(
+                checkout,
+                _Session(),
+                _Cart(_Line("sku1")),
+                idempotency_key="operation-1",
+            )
+
+        self.assertEqual(captured.exception.reason, "resource_locked")
+        self.assertEqual(captured.exception.idempotency_key, "operation-1")
+        self.assertEqual(captured.exception.external_reference, EXTERNAL_REFERENCE)
+        # Nothing to clean up: we never learned of an Order to cancel.
+        self.assertIsNone(captured.exception.order_id)
+        sdk.order.return_value.cancel.assert_not_called()
 
     async def test_http_timeout_or_server_error_blocks_the_fallback(self):
         for status in (408, 500, 503):

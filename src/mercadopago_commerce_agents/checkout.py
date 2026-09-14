@@ -67,7 +67,7 @@ from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
 import mercadopago
@@ -91,6 +91,9 @@ _MAX_IDENTIFIER = 256
 # which would raise out of the adapter instead of failing closed.
 _MAX_IDEMPOTENCY_KEY = 64
 _IDEMPOTENCY_HEADER = "x-idempotency-key"
+# Orders answers 423 when the idempotency key is locked by a request still in flight.
+# It is a "repeat later", not a rejection, so it never means "no Order was created".
+_HTTP_LOCKED = 423
 # What a catalog record has to expose. Checked as a group so that a record which is not
 # a record at all — a dict is the usual slip — says so, instead of being reported as
 # whichever attribute happened to be read first.
@@ -244,6 +247,20 @@ class _CartSnapshot:
 
 
 @dataclass(frozen=True)
+class _ResponseCheck:  # pylint: disable=too-few-public-methods
+    """The two independent verdicts on a created-order response.
+
+    ``url`` is present only when the Order is safe to hand to the shopper.
+    ``correlated`` says whether the response is about this attempt at all, which is a
+    separate question: it is what decides whether cancelling the returned id is our
+    business or someone else's.
+    """
+
+    url: str | None
+    correlated: bool
+
+
+@dataclass(frozen=True)
 class _PricedItem:  # pylint: disable=too-few-public-methods
     """A cart line resolved against the trusted catalog.
 
@@ -375,14 +392,29 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         if order is None:
             return []
 
-        checkout_url = self._validated_url(
+        checked = self._checked_response(
             order, external_reference, total_amount, currency
         )
-        if checkout_url is None:
+        if checked.url is None:
+            order_id = order.get("id")
+            if not checked.correlated:
+                # Cleanup is only ours to perform on an Order we proved is ours. A
+                # response whose reference does not match ours describes some other
+                # operation, so cancelling the id it carries could cancel a stranger's
+                # payable Order. Stop instead, and let the host reconcile.
+                logger.error(
+                    "Mercado Pago returned an order that is not correlated to this "
+                    "attempt; refusing to cancel it."
+                )
+                self._raise_outcome_unknown(
+                    idempotency_key,
+                    external_reference,
+                    "uncorrelated_response",
+                    order_id=order_id if _valid_identifier(order_id) else None,
+                )
             # The order exists at Mercado Pago even though we refuse to hand it over.
             # Leaving it would strand a payable order on the seller's account for the
             # whole expiry window, so cancel it before falling back.
-            order_id = order.get("id")
             if not await self._cancel(order_id, idempotency_key, external_reference):
                 self._raise_outcome_unknown(
                     idempotency_key,
@@ -392,7 +424,7 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 )
             return []
         # No adapter-specific label: the commerce-agents host owns its UI.
-        return [CheckoutHandoff(url=checkout_url)]
+        return [CheckoutHandoff(url=checked.url)]
 
     # -- internals ---------------------------------------------------------------
 
@@ -490,22 +522,31 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             raise _Refused("currency_mismatch")
         return items, currency
 
-    def _validated_url(
+    def _checked_response(
         self,
         order: dict[str, Any],
         external_reference: str,
         total_amount: str,
         currency: str,
-    ) -> str | None:
-        """Return the hosted checkout URL only when the response matches intent."""
+    ) -> _ResponseCheck:
+        """What the created-order response proved about this attempt.
+
+        Two different questions, and the caller needs both. ``url`` answers whether the
+        order is safe to hand to the shopper. ``correlated`` answers whether this
+        response is about *our* attempt at all — which decides whether cleaning it up
+        is our business.
+        """
+        correlated = order.get("external_reference") == external_reference
         order_id = order.get("id")
         if not _valid_identifier(order_id):
             logger.error("Mercado Pago returned an order without a valid id.")
-            return None
+            return _ResponseCheck(url=None, correlated=correlated)
         checkout_url = order.get("checkout_url")
-        if not isinstance(checkout_url, str) or not self._is_checkout_url(checkout_url):
+        if not isinstance(checkout_url, str) or not self._is_checkout_url(
+            checkout_url, order_id
+        ):
             logger.error("Mercado Pago returned an order without a usable checkout URL.")
-            return None
+            return _ResponseCheck(url=None, correlated=correlated)
         expected_state = ("online", "manual", "created", currency, _ORDER_EXPIRATION)
         returned_state = (
             order.get("type"),
@@ -516,15 +557,14 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
             # so an order that came back without it is not the order we asked for.
             order.get("expiration_time"),
         )
-        reference_matches = order.get("external_reference") == external_reference
         if (
             returned_state != expected_state
-            or not reference_matches
+            or not correlated
             or _money(order.get("total_amount")) != Decimal(total_amount)
         ):
             logger.error("Mercado Pago returned an order that did not match the snapshot.")
-            return None
-        return checkout_url
+            return _ResponseCheck(url=None, correlated=correlated)
+        return _ResponseCheck(url=checkout_url, correlated=True)
 
     async def _cancel(
         self, order_id: Any, idempotency_key: str, external_reference: str
@@ -647,6 +687,23 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
                 external_reference,
                 "invalid_sdk_response",
             )
+        if status == _HTTP_LOCKED:
+            # Orders holds the idempotency key while a concurrent request for it is
+            # still in flight, and tells the caller to repeat later. That concurrent
+            # request may already have created a payable Order, so this is the one 4xx
+            # that must never release the host fallback. The host owns the key and the
+            # scheduling, so it repeats with the same key rather than us sleeping
+            # inside a payment call.
+            logger.error(
+                "Mercado Pago is still processing a request for this idempotency key "
+                "(HTTP %s); retry the same key before falling back.",
+                status,
+            )
+            self._raise_outcome_unknown(
+                idempotency_key,
+                external_reference,
+                "resource_locked",
+            )
         if 400 <= status < 500 and status not in (408, 409):
             if prior_transport_failure:
                 # This rejection describes only the retry. The first POST may have
@@ -749,20 +806,34 @@ class MercadoPagoCheckout:  # pylint: disable=too-few-public-methods
         ) from None
 
     @staticmethod
-    def _is_checkout_url(url: str) -> bool:
+    def _is_checkout_url(url: str, order_id: str) -> bool:
+        """Whether this URL is Mercado Pago's *and* is the link for this Order.
+
+        The host allowlist only proves the shopper lands on Mercado Pago. It does not
+        prove the link pays the Order we just validated: a response carrying our
+        ``id`` alongside a checkout URL for a different order is well-formed, passes
+        every host check, and would hand the shopper someone else's payment. Checkout
+        Pro carries the Order in the link's ``order_id``, so that is what binds them.
+        """
         if len(url) > _MAX_CHECKOUT_URL or any(
             ord(character) < 32 or ord(character) == 127 for character in url
         ):
             return False
         try:
             parts = urlsplit(url)
-            return (
+            if not (
                 parts.scheme == "https"
                 and parts.hostname in _CHECKOUT_HOSTS
                 and parts.username is None
                 and parts.password is None
                 and parts.port in (None, 443)
-            )
+            ):
+                return False
+            # parse_qs decodes percent-escapes, so a re-encoded id cannot slip past the
+            # comparison. Requiring exactly one value rejects a duplicated parameter,
+            # whose precedence is a parser detail rather than something we can rely on.
+            order_ids = parse_qs(parts.query, keep_blank_values=True).get("order_id", ())
+            return len(order_ids) == 1 and order_ids[0] == order_id
         except ValueError:
             # Invalid bracket/port syntax must fail closed, not escape the adapter.
             return False

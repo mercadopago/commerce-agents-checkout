@@ -44,6 +44,17 @@ Mercado Pago Checkout Pro as a `checkout_handoff` provider for
   the required seller reference and the checkout host — and cancels the order when that
   check fails, using a separate deterministic idempotency key. Fallback is allowed only
   after cleanup is confirmed for the same Order in `canceled` state.
+- Binds the hosted link to the Order it pays: the checkout URL is accepted only when it
+  carries exactly one `order_id` equal to the created Order's `id`. The host allowlist
+  proves the link is Mercado Pago's; this proves it is not another order's.
+- Cleans up only what it can prove is its own. A created-order response whose
+  `external_reference` differs from the one sent, or omits it, is never cancelled —
+  cancelling the id it carries could act on another Order — and raises
+  `CheckoutOutcomeUnknown` with reason `uncorrelated_response` instead.
+- Treats HTTP 423 as a locked idempotency key rather than a rejection. Orders answers 423
+  while a concurrent request for the same key is still in flight, which may already have
+  created a payable Order, so it raises `CheckoutOutcomeUnknown` with reason
+  `resource_locked` and never releases the host fallback.
 - Records the live integration observation that omitting `external_reference` returned
   HTTP 400 `required_properties` on the tested Checkout Pro Orders path, while avoiding a
   broader claim than the current published API and SDK contracts support.

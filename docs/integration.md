@@ -116,8 +116,10 @@ The package intentionally omits:
 Mercado Pago returns an order `id` and `checkout_url`. The adapter first verifies the
 expected `online` type, `manual` processing mode, `created` initial status, amount,
 currency, and required `external_reference`. It accepts the URL only when it uses HTTPS,
-has no embedded credentials, uses port 443 or the default HTTPS port, and matches an
-explicit Mercado Pago hostname.
+has no embedded credentials, uses port 443 or the default HTTPS port, matches an
+explicit Mercado Pago hostname, and carries exactly one `order_id` equal to the `id` of
+the Order just validated. The hostname proves the link is Mercado Pago's; the `order_id`
+proves it pays *this* Order.
 
 The accepted URL becomes:
 
@@ -127,7 +129,10 @@ The accepted URL becomes:
 
 When that validation fails the order has already been created, so the adapter cancels it
 through `sdk.order().cancel(order_id, request_options)` with a separate deterministic
-idempotency key. It returns `[]` only after Mercado Pago confirms the cancellation. If the
+idempotency key — but only when the returned `external_reference` matches the one sent.
+A response that does not carry our reference was never proven to describe our attempt,
+and cancelling the id it holds could cancel a different Order, so the adapter raises
+`CheckoutOutcomeUnknown` with reason `uncorrelated_response` instead of cleaning up. It returns `[]` only after Mercado Pago confirms the cancellation. If the
 response does not identify that same Order in `canceled` state, cleanup fails, is
 interrupted, or the order ID cannot be read, it raises
 `CheckoutOutcomeUnknown` so the host cannot silently expose its fallback while an Order
@@ -150,7 +155,9 @@ carts before handoff.
 After a POST may have reached Mercado Pago, fallback is allowed only when the result is
 proven or a refused Order is confirmed canceled. Otherwise the method raises
 `CheckoutOutcomeUnknown`, including when a retry receives a client error after the first
-response was lost. The exception exposes the operation key and reference for controlled
+response was lost, and including HTTP 423: that status means a request for this key is
+still in flight and should be repeated later, not that no Order exists, so it raises with
+reason `resource_locked` rather than releasing the fallback. The exception exposes the operation key and reference for controlled
 reconciliation. Its `order_id` attribute is populated only when a failed cleanup had
 already identified the Order. Its message and adapter logs expose none of those
 identifiers; do not convert it to `[]`.

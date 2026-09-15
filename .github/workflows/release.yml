@@ -1,0 +1,492 @@
+# Copyright 2026 Mercado Pago
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+# A release first reaches TestPyPI, is downloaded again and verified below, and only
+# then waits for approval on the protected `pypi` environment. Keep both environment
+# names aligned with their Trusted Publisher configuration.
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  COMMERCE_AGENTS_REF: fd4d59224ab96b43c6dc6888207c67b3bd5a24cf
+  # Trust anchor for the publisher dependencies. The publishing jobs do not
+  # download executable Python code after receiving id-token: write.
+  PUBLISH_LOCK_SHA256: d374179ab41336e09a91fca210d485218ab0fc5fc8bc7bd2a1369fa179ed53a0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install and test
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          python -m pip install -e .
+          python -m pip install pylint==4.0.7 isort==8.0.1
+          python -m unittest discover -s tests
+          pylint --max-line-length=100 src/mercadopago_commerce_agents examples
+          isort --check-only --diff src tests examples
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anthropics/commerce-agents
+          ref: ${{ env.COMMERCE_AGENTS_REF }}
+          path: commerce-agents
+          persist-credentials: false
+
+      - name: Test the release against the reviewed commerce-agents commit
+        env:
+          REQUIRE_COMMERCE_AGENTS: '1'
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          python -m pip install -e .
+          python -m pip install ./commerce-agents/commerce-common ./commerce-agents/shopping-agent/core
+          python -m unittest tests.test_contract -v
+
+  build:
+    needs: [test, contract]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip==26.2.1 build==1.5.0
+
+      - name: Verify release tag matches package version
+        run: |
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "v${package_version}" = "${GITHUB_REF_NAME}"
+
+      - name: Verify the release tag signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")"
+          tag_type="$(jq -r '.object.type' <<< "${ref}")"
+          tag_sha="$(jq -r '.object.sha' <<< "${ref}")"
+          test "${tag_type}" = "tag"
+          tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")"
+          test "$(jq -r '.verification.verified' <<< "${tag_object}")" = "true"
+          # Signing the tag proves who made it, not which commit this job will build.
+          # The ref can be repointed between the release event and this run, which
+          # would leave a verified signature attached to a different tree than the one
+          # being packaged. Peel the annotated tag and require it to name GITHUB_SHA.
+          target_type="$(jq -r '.object.type' <<< "${tag_object}")"
+          target_sha="$(jq -r '.object.sha' <<< "${tag_object}")"
+          test "${target_type}" = "commit"
+          test "${target_sha}" = "${GITHUB_SHA}"
+
+      - name: Verify the tagged commit belongs to main
+        run: |
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+
+      - name: Build and validate distributions
+        env:
+          # Constrain the isolated build environment so the artifact does not depend on
+          # whatever setuptools happens to be newest that day, and stays above the fixed
+          # release of GHSA-h35f-9h28-mq5c.
+          PIP_CONSTRAINT: build-constraints.txt
+        run: |
+          printf 'setuptools==83.0.0\nwheel==0.45.1\n' > build-constraints.txt
+          python -m build
+          rm build-constraints.txt
+
+      # Everything below this point installs and executes third-party code fetched
+      # from the network, in a workspace where dist/ is still writable. Seal the
+      # artifact first: the recorded digests are what every later step and every
+      # downstream job check against, so a dependency that rewrites a wheel after the
+      # build is detected instead of being packaged, uploaded and compared to itself.
+      - name: Seal the built distributions
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum -- * > ../dist.sha256 )
+          cat dist.sha256
+
+      - name: Store distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+      # Kept out of the distributions artifact on purpose: everything in there is
+      # uploaded verbatim by `twine upload dist/*`.
+      - name: Store the distribution digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-package-digests
+          path: dist.sha256
+          if-no-files-found: error
+
+      - name: Confirm the sealed distributions are unchanged
+        run: ( cd dist && sha256sum --check --strict ../dist.sha256 )
+
+      - name: Prepare and verify the hash-locked publisher
+        run: |
+          set -euo pipefail
+          echo "${PUBLISH_LOCK_SHA256}  requirements/publish.txt" | sha256sum --check --strict
+          python -m pip download \
+            --require-hashes \
+            --only-binary=:all: \
+            --dest publisher-wheelhouse \
+            --requirement requirements/publish.txt
+          python -m venv /tmp/publisher-check
+          /tmp/publisher-check/bin/pip install \
+            --no-index \
+            --require-hashes \
+            --only-binary=:all: \
+            --find-links publisher-wheelhouse \
+            --requirement requirements/publish.txt
+          /tmp/publisher-check/bin/pip check
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          /tmp/publisher-check/bin/python -m twine check dist/*
+          /tmp/publisher-check/bin/python -m twine --version
+
+      - name: Audit what the artifact actually resolves
+        run: |
+          set -euo pipefail
+          # The CI job audits a development environment; this audits the environment a
+          # user gets from this wheel, which is the one that ships.
+          python -m venv /tmp/artifact-check
+          /tmp/artifact-check/bin/pip install --upgrade pip==26.2.1 setuptools==83.0.0
+          /tmp/artifact-check/bin/pip install dist/*.whl
+          /tmp/artifact-check/bin/pip check
+          # Prove the wheel imports before removing only the unpublished root package.
+          # Its installed dependencies remain and are what pip-audit evaluates below.
+          /tmp/artifact-check/bin/python -c "import mercadopago_commerce_agents as m; print(m.__all__)"
+          /tmp/artifact-check/bin/pip uninstall --yes mercadopago-commerce-agents-checkout
+          /tmp/artifact-check/bin/pip install "pip-audit==2.9.0"
+          /tmp/artifact-check/bin/pip-audit --strict --desc
+          /tmp/artifact-check/bin/pip-audit \
+            --strict \
+            --desc \
+            --requirement requirements/publish.txt
+          # The audit just ran third-party code next to dist/. Prove it did not touch
+          # what was sealed and uploaded.
+          ( cd dist && sha256sum --check --strict ../dist.sha256 )
+
+      - name: Store hash-locked publisher dependencies
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-publisher-dependencies
+          path: |
+            publisher-wheelhouse/
+            requirements/publish.txt
+          if-no-files-found: error
+
+  publish-testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/mercadopago-commerce-agents-checkout
+    permissions:
+      id-token: write
+    steps:
+      # A missing environment is otherwise created automatically without protections.
+      # Requiring an environment-scoped sentinel makes that situation fail closed.
+      - name: Verify the TestPyPI environment is configured
+        env:
+          PUBLISH_TARGET: ${{ vars.PUBLISH_TARGET }}
+        run: test "${PUBLISH_TARGET}" = "testpypi"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Retrieve distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Retrieve the distribution digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-package-digests
+          path: digests/
+
+      # Nothing is published before the bytes are proven to be the ones sealed at
+      # build time, and this runs before any publisher dependency is installed.
+      - name: Verify the distributions against the sealed digests
+        run: ( cd dist && sha256sum --check --strict ../digests/dist.sha256 )
+
+      - name: Retrieve hash-locked publisher dependencies
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-publisher-dependencies
+          path: publisher/
+
+      - name: Prepare verified publisher offline
+        run: |
+          set -euo pipefail
+          echo "${PUBLISH_LOCK_SHA256}  publisher/requirements/publish.txt" | sha256sum --check --strict
+          python -m venv /tmp/publisher
+          /tmp/publisher/bin/pip install \
+            --no-index \
+            --require-hashes \
+            --only-binary=:all: \
+            --find-links publisher/publisher-wheelhouse \
+            --requirement publisher/requirements/publish.txt
+          /tmp/publisher/bin/pip check
+
+      # Twine 7 obtains and exchanges the short-lived OIDC credential itself. No
+      # long-lived token or token value is stored in a workflow output or log.
+      - name: Publish to TestPyPI
+        env:
+          TWINE_NON_INTERACTIVE: "1"
+        run: >-
+          /tmp/publisher/bin/python -m twine upload
+          --non-interactive
+          --skip-existing
+          --repository-url https://test.pypi.org/legacy/
+          dist/*
+
+  validate-testpypi:
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.14']
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Retrieve the distributions built by this release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Download and verify the TestPyPI distributions
+        env:
+          PACKAGE_NAME: mercadopago-commerce-agents-checkout
+        run: |
+          set -euo pipefail
+          package_version="${GITHUB_REF_NAME#v}"
+          mkdir testpypi-dist
+
+          # The first release of a project may take a couple of minutes to appear.
+          found=0
+          for attempt in $(seq 1 18); do
+            if curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error \
+              --output /tmp/index-release.json \
+              "https://test.pypi.org/pypi/${PACKAGE_NAME}/${package_version}/json"; then
+              found=1
+              break
+            fi
+            sleep 10
+          done
+          test "${found}" = "1"
+
+          find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > /tmp/expected-files
+          jq --exit-status --raw-output '.urls[].filename' /tmp/index-release.json \
+            | LC_ALL=C sort > /tmp/published-files
+          test "$(wc -l < /tmp/expected-files)" -eq 2
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          diff --unified /tmp/expected-files /tmp/published-files
+
+          while IFS= read -r filename; do
+            expected_sha="$(sha256sum "dist/${filename}" | cut -d ' ' -f 1)"
+            published_sha="$(jq --exit-status --raw-output --arg filename "${filename}" \
+              '.urls[] | select(.filename == $filename) | .digests.sha256' \
+              /tmp/index-release.json)"
+            test "${expected_sha}" = "${published_sha}"
+
+            artifact_url="$(jq --exit-status --raw-output --arg filename "${filename}" \
+              '.urls[] | select(.filename == $filename) | .url' /tmp/index-release.json)"
+            case "${artifact_url}" in
+              https://test-files.pythonhosted.org/*) ;;
+              *) echo "Unexpected TestPyPI artifact host" >&2; exit 1 ;;
+            esac
+            curl --proto '=https' --tlsv1.2 --fail-with-body --location \
+              --silent --show-error --output "testpypi-dist/${filename}" "${artifact_url}"
+            downloaded_sha="$(sha256sum "testpypi-dist/${filename}" | cut -d ' ' -f 1)"
+            test "${expected_sha}" = "${downloaded_sha}"
+          done < /tmp/expected-files
+
+          wheel_name="$(find dist -maxdepth 1 -type f -name '*.whl' -printf '%f\n')"
+
+          python -m venv /tmp/testpypi-install
+          /tmp/testpypi-install/bin/pip install --upgrade pip==26.2.1 setuptools==83.0.0
+          /tmp/testpypi-install/bin/pip install "testpypi-dist/${wheel_name}"
+          /tmp/testpypi-install/bin/pip check
+          PACKAGE_VERSION="${package_version}" /tmp/testpypi-install/bin/python -c \
+            'import os; from importlib.metadata import version; import mercadopago_commerce_agents; assert version("mercadopago-commerce-agents-checkout") == os.environ["PACKAGE_VERSION"]'
+
+  publish-pypi:
+    needs: validate-testpypi
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mercadopago-commerce-agents-checkout
+    permissions:
+      id-token: write
+    steps:
+      - name: Verify the protected PyPI environment is configured
+        env:
+          PUBLISH_TARGET: ${{ vars.PUBLISH_TARGET }}
+        run: test "${PUBLISH_TARGET}" = "pypi"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Retrieve distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Retrieve the distribution digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-package-digests
+          path: digests/
+
+      # Nothing is published before the bytes are proven to be the ones sealed at
+      # build time, and this runs before any publisher dependency is installed.
+      - name: Verify the distributions against the sealed digests
+        run: ( cd dist && sha256sum --check --strict ../digests/dist.sha256 )
+
+      - name: Retrieve hash-locked publisher dependencies
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-publisher-dependencies
+          path: publisher/
+
+      - name: Prepare verified publisher offline
+        run: |
+          set -euo pipefail
+          echo "${PUBLISH_LOCK_SHA256}  publisher/requirements/publish.txt" | sha256sum --check --strict
+          python -m venv /tmp/publisher
+          /tmp/publisher/bin/pip install \
+            --no-index \
+            --require-hashes \
+            --only-binary=:all: \
+            --find-links publisher/publisher-wheelhouse \
+            --requirement publisher/requirements/publish.txt
+          /tmp/publisher/bin/pip check
+
+      - name: Publish to PyPI
+        env:
+          TWINE_NON_INTERACTIVE: "1"
+        run: >-
+          /tmp/publisher/bin/python -m twine upload
+          --non-interactive
+          dist/*
+
+  validate-pypi:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Retrieve the distributions built by this release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Download and verify the PyPI distributions
+        env:
+          PACKAGE_NAME: mercadopago-commerce-agents-checkout
+        run: |
+          set -euo pipefail
+          package_version="${GITHUB_REF_NAME#v}"
+          mkdir pypi-dist
+
+          found=0
+          for attempt in $(seq 1 18); do
+            if curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error \
+              --output /tmp/index-release.json \
+              "https://pypi.org/pypi/${PACKAGE_NAME}/${package_version}/json"; then
+              found=1
+              break
+            fi
+            sleep 10
+          done
+          test "${found}" = "1"
+
+          find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > /tmp/expected-files
+          jq --exit-status --raw-output '.urls[].filename' /tmp/index-release.json \
+            | LC_ALL=C sort > /tmp/published-files
+          test "$(wc -l < /tmp/expected-files)" -eq 2
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          diff --unified /tmp/expected-files /tmp/published-files
+
+          while IFS= read -r filename; do
+            expected_sha="$(sha256sum "dist/${filename}" | cut -d ' ' -f 1)"
+            published_sha="$(jq --exit-status --raw-output --arg filename "${filename}" \
+              '.urls[] | select(.filename == $filename) | .digests.sha256' \
+              /tmp/index-release.json)"
+            test "${expected_sha}" = "${published_sha}"
+
+            artifact_url="$(jq --exit-status --raw-output --arg filename "${filename}" \
+              '.urls[] | select(.filename == $filename) | .url' /tmp/index-release.json)"
+            case "${artifact_url}" in
+              https://files.pythonhosted.org/*) ;;
+              *) echo "Unexpected PyPI artifact host" >&2; exit 1 ;;
+            esac
+            curl --proto '=https' --tlsv1.2 --fail-with-body --location \
+              --silent --show-error --output "pypi-dist/${filename}" "${artifact_url}"
+            downloaded_sha="$(sha256sum "pypi-dist/${filename}" | cut -d ' ' -f 1)"
+            test "${expected_sha}" = "${downloaded_sha}"
+          done < /tmp/expected-files
+
+          wheel_name="$(find dist -maxdepth 1 -type f -name '*.whl' -printf '%f\n')"
+          python -m venv /tmp/pypi-install
+          /tmp/pypi-install/bin/pip install --upgrade pip==26.2.1 setuptools==83.0.0
+          /tmp/pypi-install/bin/pip install "pypi-dist/${wheel_name}"
+          /tmp/pypi-install/bin/pip check
+          PACKAGE_VERSION="${package_version}" /tmp/pypi-install/bin/python -c \
+            'import os; from importlib.metadata import version; import mercadopago_commerce_agents; assert version("mercadopago-commerce-agents-checkout") == os.environ["PACKAGE_VERSION"]'

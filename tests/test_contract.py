@@ -16,11 +16,12 @@ from Anthropic's repository. CI runs it in a job that clones the repo at a pinne
 commit — see ``.github/workflows/ci.yml``.
 """
 
+import os
 import unittest
 from dataclasses import MISSING
 from types import SimpleNamespace
 
-from mercadopago_commerce_agents import CheckoutHandoff
+from mercadopago_commerce_agents import CheckoutHandoff, CheckoutOutcomeUnknown
 
 try:  # commerce-agents is an optional, unpublished dependency
     from shopping_agent.enrichment import enrich_checkout
@@ -29,6 +30,8 @@ try:  # commerce-agents is an optional, unpublished dependency
 
     UPSTREAM = True
 except ImportError:  # pragma: no cover - the default local run
+    if os.environ.get("REQUIRE_COMMERCE_AGENTS") == "1":
+        raise
     UPSTREAM = False
 
 
@@ -49,15 +52,18 @@ class ContractTest(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_real_enrich_checkout_accepts_our_handoff(self):
-        """The actual consumer, unmodified, fed our type."""
+        """The real consumer calls a strict host wrapper that forwards its saved ids."""
         cart = Cart(items=[CartItem(product_id="sku1", title="A thing", price=10.0, quantity=1)])
         handoff = CheckoutHandoff(url="https://www.mercadopago.com.br/checkout", label="Pay")
-
-        backend = SimpleNamespace(
-            get_cart=_returning(cart),
-            checkout_handoff=_returning([handoff]),
+        attempt = SimpleNamespace(
+            external_reference="seller-order-1",
+            idempotency_key="operation-1",
         )
-        context = SimpleNamespace(backend=backend, session=SimpleNamespace(session_id="s"))
+        adapter = _AdapterSpy([handoff])
+        backend = _StrictBackend(cart=cart, adapter=adapter, attempt=attempt)
+        session = SimpleNamespace(session_id="s")
+
+        context = SimpleNamespace(backend=backend, session=session)
 
         enriched = await enrich_checkout(_Payload(), context)
 
@@ -65,6 +71,42 @@ class ContractTest(unittest.IsolatedAsyncioTestCase):
             enriched["handoffs"],
             [{"url": "https://www.mercadopago.com.br/checkout", "label": "Pay"}],
         )
+        self.assertEqual(
+            adapter.calls,
+            [
+                (
+                    session,
+                    cart,
+                    {
+                        "external_reference": attempt.external_reference,
+                        "idempotency_key": attempt.idempotency_key,
+                    },
+                )
+            ],
+        )
+
+    async def test_real_enrich_checkout_propagates_an_unknown_outcome(self):
+        """The host must not convert an ambiguous POST into its fallback checkout."""
+        cart = Cart(
+            items=[CartItem(product_id="sku1", title="A thing", price=10.0, quantity=1)]
+        )
+        error = CheckoutOutcomeUnknown(
+            external_reference="seller-order-1",
+            idempotency_key="operation-1",
+            reason="transport_failure",
+        )
+        backend = SimpleNamespace(
+            get_cart=_returning(cart),
+            checkout_handoff=_raising(error),
+        )
+        context = SimpleNamespace(
+            backend=backend, session=SimpleNamespace(session_id="s")
+        )
+
+        with self.assertRaises(CheckoutOutcomeUnknown) as captured:
+            await enrich_checkout(_Payload(), context)
+
+        self.assertIs(captured.exception, error)
 
 
 class _Payload:
@@ -74,9 +116,62 @@ class _Payload:
         return {"summary": "checkout"}
 
 
+class _StrictBackend:
+    """Keep commerce-agents' two-argument interface around the stricter adapter."""
+
+    def __init__(self, *, cart, adapter, attempt):
+        self._cart = cart
+        self._adapter = adapter
+        self._attempt = attempt
+
+    async def get_cart(self, _session):
+        """Return the cart that commerce-agents passes back to the wrapper."""
+        return self._cart
+
+    async def checkout_handoff(self, session, cart):
+        """Forward the durable attempt pair as required keyword-only arguments."""
+        return await self._adapter.checkout_handoff(
+            session,
+            cart,
+            external_reference=self._attempt.external_reference,
+            idempotency_key=self._attempt.idempotency_key,
+        )
+
+
+class _AdapterSpy:
+    """Record calls while enforcing the adapter's required keyword-only contract."""
+
+    def __init__(self, handoffs):
+        self._handoffs = handoffs
+        self.calls = []
+
+    async def checkout_handoff(
+        self, session, cart, *, external_reference, idempotency_key
+    ):
+        """Capture the exact persisted identifiers supplied by the host wrapper."""
+        self.calls.append(
+            (
+                session,
+                cart,
+                {
+                    "external_reference": external_reference,
+                    "idempotency_key": idempotency_key,
+                },
+            )
+        )
+        return self._handoffs
+
+
 def _returning(value):
     async def _call(*_args, **_kwargs):
         return value
+
+    return _call
+
+
+def _raising(error):
+    async def _call(*_args, **_kwargs):
+        raise error
 
     return _call
 

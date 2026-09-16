@@ -9,19 +9,12 @@ the request sent to Mercado Pago, the conditions under which a handoff is refuse
 public constructor surface — those are the three things a consuming host must re-verify
 before upgrading.
 
-## [0.1.0b2] - 2026-09-14
+## [0.1.0b3] - 2026-09-16
 
-Security hardening for the Checkout Pro handoff introduced in `0.1.0b1`.
+Recovery and release-integrity hardening on top of `0.1.0b2`.
 
 ### Fixed
 
-- Binds the hosted link to the Order it pays: the checkout URL is accepted only when it
-  carries exactly one `order_id` equal to the created Order's `id`. The host allowlist
-  proves the link is Mercado Pago's; this proves it is not another order's.
-- Cleans up only what it can prove is its own. A created-order response whose
-  `external_reference` differs from the one sent, or omits it, is never cancelled —
-  cancelling the id it carries could act on another Order — and raises
-  `CheckoutOutcomeUnknown` with reason `uncorrelated_response` instead.
 - Documents `recovering: bool = False` as part of the public surface in
   `docs/integration.md` and the README API summary, with the host's obligation to
   persist the inconclusive outcome and forward it on retries. A test compares the
@@ -44,10 +37,31 @@ Security hardening for the Checkout Pro handoff introduced in `0.1.0b1`.
   (visible ASCII). A key `requests` or `http.client` rejects used to surface as a
   transport failure, which the adapter reports as "an Order may exist" — for a request
   that never left the process.
-- Strips the SDK exception from `CheckoutOutcomeUnknown.__context__`. `raise ... from
-  None` only hides the chain from printed tracebacks; the raw error object, with any
-  request URL and headers it carries, stayed reachable to host logging and
-  instrumentation.
+- Strips SDK and catalog exceptions from `CheckoutOutcomeUnknown.__context__`.
+  `raise ... from None` only hides the chain from printed tracebacks; the raw error
+  object, with any request URL and headers it carries, otherwise stays reachable to
+  host logging and instrumentation.
+
+### Security
+
+- Binds a release to its verified signed tag target, seals wheel and sdist hashes before
+  executing publisher dependencies, audits the installed artifact, and verifies that
+  the files downloaded from TestPyPI are byte-for-byte the distributions built by the
+  release job.
+
+## [0.1.0b2] - 2026-09-14
+
+Security hardening for the Checkout Pro handoff introduced in `0.1.0b1`.
+
+### Fixed
+
+- Binds the hosted link to the Order it pays: the checkout URL is accepted only when it
+  carries exactly one `order_id` equal to the created Order's `id`. The host allowlist
+  proves the link is Mercado Pago's; this proves it is not another order's.
+- Cleans up only what it can prove is its own. A created-order response whose
+  `external_reference` differs from the one sent, or omits it, is never cancelled —
+  cancelling the id it carries could act on another Order — and raises
+  `CheckoutOutcomeUnknown` with reason `uncorrelated_response` instead.
 - Treats HTTP 423 as a locked idempotency key rather than a rejection. Orders answers 423
   while a concurrent request for the same key is still in flight, which may already have
   created a payable Order, so it raises `CheckoutOutcomeUnknown` with reason

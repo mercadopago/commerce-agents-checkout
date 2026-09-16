@@ -415,6 +415,14 @@ jobs:
             --requirement publisher/requirements/publish.txt
           /tmp/publisher/bin/pip check
 
+      - name: Refuse prerelease metadata for production PyPI
+        env:
+          PACKAGE_VERSION: ${{ github.event.release.tag_name }}
+        run: >-
+          /tmp/publisher/bin/python -c
+          'import os; from packaging.version import Version;
+          assert not Version(os.environ["PACKAGE_VERSION"].removeprefix("v")).is_prerelease'
+
       - name: Publish to PyPI
         env:
           TWINE_NON_INTERACTIVE: "1"

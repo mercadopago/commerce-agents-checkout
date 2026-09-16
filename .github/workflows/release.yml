@@ -116,10 +116,27 @@ jobs:
           test "${target_type}" = "commit"
           test "${target_sha}" = "${GITHUB_SHA}"
 
-      - name: Verify the tagged commit belongs to main
+      - name: Verify the release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          BETA_SOURCE_SHA: fa2b1cd110a95c7c9b7bffcd61d2fae76a97c7f4
         run: |
-          git show-ref --verify --quiet refs/remotes/origin/main
-          git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+          set -euo pipefail
+
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            # This one-off beta must package the exact CI-validated PR tree. Its signed release
+            # commit may change only this guarded workflow.
+            test "${GITHUB_REF_NAME}" = "v0.1.0b3"
+            test "$(git cat-file -p "${GITHUB_SHA}" | grep -c '^parent ')" = "1"
+            test "$(git rev-parse "${GITHUB_SHA}^")" = "${BETA_SOURCE_SHA}"
+            test "$(git diff --name-only "${BETA_SOURCE_SHA}" "${GITHUB_SHA}")" = ".github/workflows/release.yml"
+            test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BETA_SOURCE_SHA}" --jq '.commit.verification.verified')" = "true"
+            test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.verification.verified')" = "true"
+          else
+            git show-ref --verify --quiet refs/remotes/origin/main
+            git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+          fi
 
       - name: Build and validate distributions
         env:

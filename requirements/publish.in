@@ -1,0 +1,3 @@
+# Publishing runs in an OIDC-enabled job. Keep its executable dependency surface
+# deliberately small and resolve it to hashes in publish.txt.
+twine==7.0.0

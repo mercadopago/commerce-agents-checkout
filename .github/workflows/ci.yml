@@ -19,87 +19,120 @@ env:
   # deliberately, with the contract test green.
   COMMERCE_AGENTS_REF: fd4d59224ab96b43c6dc6888207c67b3bd5a24cf
 
+permissions:
+  contents: read
+
 jobs:
   test:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip==26.2.1 setuptools==83.0.0
           pip install -e .
-          pip install pylint isort
+          pip install pylint==4.0.7 isort==8.0.1
 
       # No network and nothing from Anthropic's repo: the package must stand alone.
       - name: Test
         run: python -m unittest discover -s tests
 
       - name: Lint with Pylint
-        run: pylint --max-line-length=100 src/mercadopago_commerce_agents
+        run: pylint --max-line-length=100 src/mercadopago_commerce_agents examples
+
+      - name: Audit dependencies
+        run: |
+          pip install "pip-audit==2.9.0"
+          # In strict mode, pip-audit correctly fails when it encounters an editable
+          # distribution, even with --skip-editable. Remove only the unpublished root
+          # package; its resolved dependencies remain installed and are audited below.
+          pip uninstall --yes mercadopago-commerce-agents-checkout
+          pip-audit --strict --desc
 
       - name: Lint with Isort
-        run: isort --check-only --diff src tests
+        run: isort --check-only --diff src tests examples
+
+  minimum-dependencies:
+    # `pip install -e .` resolves the newest SDK, so the declared floor is never
+    # exercised. RequestOptions and the Order resource differ across versions, and the
+    # unit tests mock them — this job runs the real boundary at the floor.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Install at the declared floor
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          pip install -e .
+          pip install "mercadopago==3.5.0"
+          pip check
+
+      - name: Test
+        run: python -m unittest discover -s tests
 
   contract:
     # Blocking. Proves this release works with the pinned commerce-agents commit.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: anthropics/commerce-agents
           ref: ${{ env.COMMERCE_AGENTS_REF }}
           path: commerce-agents
+          persist-credentials: false
 
       - name: Install with commerce-agents
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip==26.2.1
           pip install -e .
           pip install ./commerce-agents/commerce-common ./commerce-agents/shopping-agent/core
 
       - name: Contract test
+        env:
+          REQUIRE_COMMERCE_AGENTS: '1'
         run: python -m unittest tests.test_contract -v
 
   contract-drift-warning:
-    # Non-blocking early warning: the same test against upstream HEAD. A failure here
-    # means the next pin bump needs work, not that this release is broken.
+    # Non-blocking early warning without executing mutable upstream code. When this
+    # fires, update the pin in a reviewed PR; the blocking contract job will test it.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - uses: actions/checkout@v4
-        with:
-          repository: anthropics/commerce-agents
-          ref: main
-          path: commerce-agents
-
-      - name: Install with commerce-agents@main
+      - name: Check whether the reviewed commerce-agents pin is current
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-          pip install ./commerce-agents/commerce-common ./commerce-agents/shopping-agent/core
-
-      - name: Contract test against upstream HEAD
-        run: python -m unittest tests.test_contract -v
+          upstream_head="$(git ls-remote https://github.com/anthropics/commerce-agents.git refs/heads/main | cut -f1)"
+          test -n "${upstream_head}"
+          if [ "${upstream_head}" != "${COMMERCE_AGENTS_REF}" ]; then
+            echo "::warning::commerce-agents main moved to ${upstream_head}; review it and update COMMERCE_AGENTS_REF in a PR"
+            exit 1
+          fi

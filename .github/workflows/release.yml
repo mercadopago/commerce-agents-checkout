@@ -361,6 +361,7 @@ jobs:
             'import os; from importlib.metadata import version; import mercadopago_commerce_agents; assert version("mercadopago-commerce-agents-checkout") == os.environ["PACKAGE_VERSION"]'
 
   publish-pypi:
+    if: github.event.release.prerelease == false
     needs: validate-testpypi
     runs-on: ubuntu-latest
     environment:
@@ -423,6 +424,7 @@ jobs:
           dist/*
 
   validate-pypi:
+    if: github.event.release.prerelease == false
     needs: publish-pypi
     runs-on: ubuntu-latest
     steps:

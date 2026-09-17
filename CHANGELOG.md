@@ -9,7 +9,21 @@ the request sent to Mercado Pago, the conditions under which a handoff is refuse
 public constructor surface — those are the three things a consuming host must re-verify
 before upgrading.
 
-## [0.1.0b4] - 2026-09-16
+## [0.1.0] - 2026-09-17
+
+First non-prerelease PEP 440 release. The public API, Orders API request and runtime
+behavior are unchanged from `0.1.0b4`. The evolving `0.x` line remains classified as
+Beta rather than promising long-term API stability.
+
+### Changed
+
+- Promotes the runtime validated by the `0.1.0b4` TestPyPI rehearsal without code or
+  dependency changes. The release pipeline built and sealed one wheel and one sdist,
+  verified the published bytes, and clean-installed the wheel on Python 3.11 and 3.14.
+- Makes the normal PyPI installation command the default in the README and marks the
+  `0.1.x` line as the supported security-fix line.
+
+## [0.1.0b4] - 2026-09-17
 
 Release-infrastructure rehearsal for the first stable release. The public API and
 runtime behavior are unchanged from `0.1.0b3`.

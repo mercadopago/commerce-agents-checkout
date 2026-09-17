@@ -1,4 +1,28 @@
-# Mercado Pago Checkout Pro for commerce-agents
+<p align="center">
+  <a href="https://www.mercadopago.com">
+    <img src="https://github.com/mercadopago.png?size=160" alt="Mercado Pago" width="88" />
+  </a>
+</p>
+
+<h1 align="center">Mercado Pago Checkout Pro for commerce-agents</h1>
+
+<p align="center">
+  A secure Checkout Pro adapter for <a href="https://github.com/anthropics/commerce-agents">commerce-agents</a>.
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/mercadopago-commerce-agents-checkout/"><img src="https://img.shields.io/pypi/v/mercadopago-commerce-agents-checkout?label=PyPI&color=009EE3" alt="PyPI" /></a>
+  <a href="https://github.com/mercadopago/commerce-agents-checkout/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-009EE3" alt="Apache-2.0 License" /></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11 or newer" /></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> · <a href="./SECURITY.md">Security</a> · <a href="#documentation">Documentation</a>
+</p>
+
+---
+
+## Overview
 
 `mercadopago-commerce-agents-checkout` is an independent Mercado Pago integration that
 helps a seller backend implement the `StorefrontBackend` handoff from

@@ -29,7 +29,8 @@ prefer otherwise.
 ## Supported versions
 
 Until `1.0.0`, only the latest released minor version receives security fixes. The
-project is pre-release today; see [CHANGELOG.md](CHANGELOG.md).
+currently supported line is `0.1.x`; earlier pre-release builds such as `0.1.0b4` are
+superseded by `0.1.0` and do not receive backports. See [CHANGELOG.md](CHANGELOG.md).
 
 ## What is in scope
 

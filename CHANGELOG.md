@@ -9,6 +9,21 @@ the request sent to Mercado Pago, the conditions under which a handoff is refuse
 public constructor surface — those are the three things a consuming host must re-verify
 before upgrading.
 
+## [0.1.0b4] - 2026-09-16
+
+Release-infrastructure rehearsal for the first stable release. The public API and
+runtime behavior are unchanged from `0.1.0b3`.
+
+### Changed
+
+- Moves every official GitHub Action used by CI and release publishing to its verified,
+  full-length SHA for the corresponding Node 24 release: `actions/checkout@v7.0.1`,
+  `actions/setup-python@v7.0.0`, `actions/upload-artifact@v7.0.1`, and
+  `actions/download-artifact@v8.0.1`.
+- Exercises the complete TestPyPI build, sealing, publication, download, hash comparison,
+  and clean-install path before promoting the same runtime to `0.1.0`. Production PyPI
+  remains disabled for this prerelease.
+
 ## [0.1.0b3] - 2026-09-16
 
 Recovery and release-integrity hardening on top of `0.1.0b2`.

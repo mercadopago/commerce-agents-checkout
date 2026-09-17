@@ -78,7 +78,7 @@ python -m pip install \
   "urllib3>=2.7.0,<3"
 python -m pip install --no-deps \
   --index-url https://test.pypi.org/simple/ \
-  mercadopago-commerce-agents-checkout==0.1.0b3
+  mercadopago-commerce-agents-checkout==0.1.0b4
 ```
 
 Pre-release versions are intentionally not selected by every dependency resolver unless
